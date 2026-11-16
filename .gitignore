@@ -6,3 +6,5 @@ dist/
 # Real task banks (with gold answers) must stay private
 data/*.json
 !data/tasks.sample.json
+site/download/
+!data/honeypots.sample.json

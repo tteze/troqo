@@ -1,211 +1,279 @@
-import { describe, expect, it } from "vitest";
-import { Troqo, WORK_CAPABILITY } from "../src/engine.js";
-import { agentIdFromKey, generateAgentKey } from "../src/http.js";
-import { mockImageProvider } from "../src/providers.js";
-import type { TaskDefinition } from "../src/types.js";
+import { afterEach, describe, expect, it } from "vitest";
+import { generateIdentity, signRequest } from "../src/shared/crypto.js";
+import { backdate, market, SPEC, type TestMarket } from "./helpers.js";
 
-const OPTIONS = ["yes", "no"];
-const bank = (real: number, gold: number): TaskDefinition[] => [
-  ...Array.from({ length: real }, (_, i) => ({
-    id: `r${i}`,
-    kind: "classify" as const,
-    instruction: "Is it a fruit?",
-    input: `item ${i}`,
-    options: OPTIONS,
-  })),
-  ...Array.from({ length: gold }, (_, i) => ({
-    id: `g${i}`,
-    kind: "classify" as const,
-    instruction: "Is it a fruit?",
-    input: `apple ${i}`,
-    options: OPTIONS,
-    gold: "yes",
-  })),
-];
+let m: TestMarket;
+afterEach(() => m?.close());
 
-const MISSION = {
-  kind: "code",
-  title: "Write a slugify function",
-  spec: "TypeScript function slugify(s: string): string, lowercase, dashes between words.",
-  acceptance: "slugify('Hello World') === 'hello-world'",
-  priceCredits: 6,
-};
-
-/** Engine where `agents` hold credits and `mediators` are eligible to mediate. */
-function setup(credits: Record<string, number> = { req: 10 }, mediators = ["m1", "m2", "m3", "m4"]) {
-  const t = new Troqo({ dbPath: ":memory:" }, [mockImageProvider(3)]);
-  t.loadTasks(bank(20, 5));
-  for (const [a, c] of Object.entries(credits)) {
-    t.db.prepare("INSERT INTO ledger (agent_id, credits) VALUES (?, ?)").run(a, c);
-  }
-  for (const m of mediators) {
-    t.db.prepare("INSERT INTO ledger (agent_id, credits, batches_passed) VALUES (?, 0, 5)").run(m);
-  }
-  return t;
+/** Everything the server stores, as one string, to prove no content leaks into it. */
+function serverDump(t: TestMarket): string {
+  const tables = ["agents", "missions", "mediations", "messages", "batches"];
+  return tables.map((n) => JSON.stringify(t.troqo.ctx.db.prepare(`SELECT * FROM ${n}`).all())).join("\n");
 }
 
-function delivered(t: Troqo) {
-  const { missionId } = t.market.postMission("req", MISSION);
-  t.market.takeMission("sol", missionId);
-  t.market.deliverMission("sol", missionId, "export const slugify = (s: string) => s.toLowerCase().split(' ').join('-');");
-  return missionId;
+async function delivered(t: TestMarket, delivery = "export const slugify = (s: string) => s.toLowerCase().split(' ').join('-');") {
+  const req = await t.agent(20);
+  const sol = await t.agent(0);
+  const posted = await req.postMission(SPEC);
+  await sol.takeMission(posted.missionId);
+  await req.sync(); // hands the encrypted spec over
+  await sol.sync(); // receives and checks it
+  await sol.deliver(posted.missionId, { mime: "text/plain", content: delivery });
+  await req.sync(); // receives the delivery
+  return { req, sol, id: posted.missionId };
 }
 
-const assigned = (t: Troqo, missionId: string, round: number) =>
-  (
-    t.db
-      .prepare("SELECT mediator_id FROM mediations WHERE mission_id = ? AND round = ? AND verdict IS NULL")
-      .all(missionId, round) as { mediator_id: string }[]
-  ).map((r) => r.mediator_id);
+describe("a mission between two agents", () => {
+  it("moves spec and delivery end to end encrypted; the server never holds them in clear", async () => {
+    m = await market();
+    const { req, sol, id } = await delivered(m);
 
-const backdate = (t: Troqo, sql: string, id: string) => t.db.prepare(sql).run("2000-01-01T00:00:00.000Z", id);
+    const solverView = await sol.mission(id);
+    expect(solverView.local.spec?.spec).toBe(SPEC.spec);
+    expect(solverView.local.specTampered).toBe(false);
+    const requesterView = await req.mission(id);
+    expect(requesterView.status).toBe("delivered");
+    expect(requesterView.local.delivery?.content).toContain("slugify");
 
-describe("mission market", () => {
-  it("locks the price in escrow and pays the solver once the requester accepts", () => {
-    const t = setup();
-    const posted = t.market.postMission("req", MISSION);
-    expect(t.balance("req")).toBe(4);
-    expect(t.market.listMissions("req")).toHaveLength(0);
-    expect(t.market.listMissions("sol")[0]).toMatchObject({ missionId: posted.missionId, priceCredits: 6 });
+    const dump = serverDump(m);
+    expect(dump).not.toContain("Lowercase; words separated");
+    expect(dump).not.toContain("toLowerCase");
+    expect(dump).toContain(SPEC.summary); // the public summary is the only text the market keeps
+    // Fetched ciphertext is erased; rows remain as proof of sending.
+    expect(m.troqo.ctx.db.prepare(`SELECT COUNT(*) AS n FROM messages WHERE envelope IS NOT NULL`).get()).toEqual({ n: 0 });
 
-    t.market.takeMission("sol", posted.missionId);
-    expect(t.market.listMissions("other")).toHaveLength(0);
-    t.market.deliverMission("sol", posted.missionId, "done");
-    expect(t.market.getMission("req", posted.missionId)).toMatchObject({ status: "delivered", delivery: "done" });
-
-    const closed = t.market.reviewDelivery("req", posted.missionId, "accept");
-    expect(closed.status).toBe("accepted");
-    expect(closed.delivery).toBeUndefined(); // Troqo keeps no work content
-    expect(t.balance("sol")).toBe(6);
-    expect(t.balance("req")).toBe(4);
+    await req.review(id, "accept");
+    expect((await sol.account()).credits).toBe(9); // 10 minus 10% burned
+    expect((await req.account()).credits).toBe(10);
+    expect(m.troqo.market.stats().credits.burned).toBe(1);
   });
 
-  it("requires credits earned beforehand", () => {
-    const t = setup({ poor: 2 });
-    expect(() => t.market.postMission("poor", MISSION)).toThrow(/costs 6 credits and your balance is 2/);
+  it("requires credits earned beforehand and keeps the mission private to its parties", async () => {
+    m = await market();
+    const poor = await m.agent(3);
+    await expect(poor.postMission(SPEC)).rejects.toMatchObject({ code: "insufficient_credits" });
+    const req = await m.agent(20);
+    const posted = await req.postMission(SPEC);
+    expect((await poor.listMissions()).map((x) => x.missionId)).toContain(posted.missionId);
+    expect(await req.listMissions()).toHaveLength(0);
+    const sol = await m.agent();
+    await sol.takeMission(posted.missionId);
+    await expect(poor.mission(posted.missionId)).rejects.toMatchObject({ code: "unknown_mission" });
+    await expect(poor.takeMission(posted.missionId)).rejects.toMatchObject({ code: "mission_not_open" });
   });
 
-  it("lets only one agent take a mission, never its requester", () => {
-    const t = setup();
-    const { missionId } = t.market.postMission("req", MISSION);
-    expect(() => t.market.takeMission("req", missionId)).toThrow(/own mission/);
-    t.market.takeMission("a", missionId);
-    expect(() => t.market.takeMission("b", missionId)).toThrow(/taken by someone else/);
-    expect(() => t.market.deliverMission("b", missionId, "x")).toThrow(/do not hold/);
+  it("refunds a mission cancelled before its spec was handed over", async () => {
+    m = await market();
+    const req = await m.agent(20);
+    const posted = await req.postMission(SPEC);
+    await (await m.agent()).takeMission(posted.missionId);
+    await req.cancelMission(posted.missionId);
+    expect((await req.account()).credits).toBe(20);
   });
 
-  it("refunds a cancelled mission and reopens one that was not delivered in time", () => {
-    const t = setup({ req: 20 });
-    const a = t.market.postMission("req", MISSION);
-    t.market.cancelMission("req", a.missionId);
-    expect(t.balance("req")).toBe(20);
+  it("applies deadlines: handoff, delivery and review", async () => {
+    m = await market();
+    const req = await m.agent(30);
+    const sol = await m.agent();
+    const a = await req.postMission(SPEC);
+    await sol.takeMission(a.missionId);
+    backdate(m, `UPDATE missions SET taken_at = ? WHERE id = ?`, a.missionId);
+    expect((await sol.listMissions()).map((x) => x.missionId)).toContain(a.missionId);
 
-    const b = t.market.postMission("req", MISSION);
-    t.market.takeMission("sol", b.missionId);
-    backdate(t, "UPDATE missions SET taken_at = ? WHERE id = ?", b.missionId);
-    expect(t.market.listMissions("other")).toHaveLength(1);
-    expect(() => t.market.deliverMission("sol", b.missionId, "late")).toThrow(/do not hold/);
+    const { req: r2, sol: s2, id } = await delivered(m);
+    backdate(m, `UPDATE missions SET delivered_at = ? WHERE id = ?`, id);
+    expect((await r2.mission(id)).status).toBe("accepted");
+    expect((await s2.account()).credits).toBe(9);
   });
+});
 
-  it("accepts a delivery the requester never reviews", () => {
-    const t = setup();
-    const id = delivered(t);
-    backdate(t, "UPDATE missions SET delivered_at = ? WHERE id = ?", id);
-    expect(t.market.myMissions("sol")[0]).toMatchObject({ missionId: id, status: "accepted" });
-    expect(t.balance("sol")).toBe(6);
-  });
+describe("disputes", () => {
+  it("first mediation, appeal to three, majority wins and the minority is not paid", async () => {
+    m = await market();
+    const mediators = await Promise.all([1, 2, 3, 4].map(() => m.agent(0, { mediator: true })));
+    const { req, sol, id } = await delivered(m);
+    await req.review(id, "contest", "It does not collapse repeated spaces.");
+    await req.sync();
+    await sol.sync(); // both parties send their pieces to the drawn mediator
 
-  it("settles a contest with one random mediator, never a party", () => {
-    const t = setup({ req: 10 }, ["m1"]);
-    const id = delivered(t);
-    expect(() => t.market.reviewDelivery("req", id, "contest", "short")).toThrow(/Explain/);
-    t.market.reviewDelivery("req", id, "contest", "It does not handle multiple spaces.");
-    expect(assigned(t, id, 1)).toEqual(["m1"]);
-    expect(t.market.listMediations("m1")[0]).toMatchObject({ missionId: id, round: 1 });
+    const first = (await Promise.all(mediators.map(async (x) => ({ x, list: await x.mediations() })))).find((e) => e.list.length)!;
+    expect(first.list[0].ready).toBe(false);
+    await first.x.sync();
+    const [d] = await first.x.mediations();
+    expect(d.ready).toBe(true);
+    expect(d.evidence?.spec?.acceptance).toBe(SPEC.acceptance);
+    expect(d.evidence?.deliveryTampered).toBe(false);
+    await first.x.mediate(id, "refuse", "Repeated spaces produce double dashes.");
+    expect((await sol.mission(id)).status).toBe("mediated");
 
-    t.market.mediate("m1", id, "accept", "The criterion given is met exactly.");
-    expect(t.market.getMission("sol", id)).toMatchObject({ status: "mediated", verdict: "accept" });
-    expect(() => t.market.respondToVerdict("sol", id, "appeal")).toThrow(/lost the mediation/);
-
-    t.market.respondToVerdict("req", id, "accept");
-    expect(t.balance("sol")).toBe(6);
-    expect(t.balance("m1")).toBe(1);
-    expect(t.balance("req")).toBe(3); // 10 - 6 escrow - 1 mediation fee
-  });
-
-  it("on appeal, three new mediators decide by majority; the minority is not paid", () => {
-    const t = setup();
-    const id = delivered(t);
-    t.market.reviewDelivery("req", id, "contest", "It does not handle multiple spaces.");
-    const [first] = assigned(t, id, 1);
-    t.market.mediate(first, id, "refuse", "Multiple spaces are not handled.");
-    t.market.respondToVerdict("sol", id, "appeal");
-
-    const panel = assigned(t, id, 2);
+    await sol.respondToVerdict(id, "appeal");
+    await req.sync();
+    await sol.sync();
+    const panel = [];
+    for (const x of mediators) {
+      if (x === first.x) continue;
+      await x.sync();
+      if ((await x.mediations()).length) panel.push(x);
+    }
     expect(panel).toHaveLength(3);
-    expect(panel).not.toContain(first);
-    t.market.mediate(panel[0], id, "accept", "The only stated criterion is met.");
-    t.market.mediate(panel[1], id, "refuse", "Spaces should collapse into one dash.");
-    expect(t.market.getMission("req", id).status).toBe("appealed");
-    t.market.mediate(panel[2], id, "accept", "The acceptance test passes as written.");
+    await panel[0].mediate(id, "accept", "The only stated criterion is met.");
+    await panel[1].mediate(id, "refuse", "Spaces should collapse into one dash.");
+    await panel[2].mediate(id, "accept", "The acceptance example passes as written.");
 
-    expect(t.market.getMission("req", id).status).toBe("accepted");
-    expect(t.balance("sol")).toBe(6);
-    expect(t.balance(panel[0])).toBe(1);
-    expect(t.balance(panel[2])).toBe(1);
-    expect(t.balance(panel[1])).toBe(0);
-    expect(t.balance(first)).toBe(0);
-    expect(t.balance("req")).toBe(2); // 10 - 6 - 2 fees
+    expect((await req.mission(id)).status).toBe("accepted");
+    expect((await sol.account()).credits).toBe(9);
+    expect((await panel[0].account()).credits).toBe(1);
+    expect((await panel[2].account()).credits).toBe(1);
+    expect((await panel[1].account()).credits).toBe(0);
+    expect((await first.x.account()).credits).toBe(0);
+    expect((await req.account()).credits).toBe(8); // 20 - 10 escrow - 2 fees
   });
 
-  it("lets a losing party go into debt, which blocks new missions until worked off", () => {
-    const t = setup({ req: 6 }, ["m1"]);
-    const id = delivered(t);
-    t.market.reviewDelivery("req", id, "contest", "It does not handle multiple spaces.");
-    t.market.mediate("m1", id, "accept", "The criterion given is met exactly.");
-    t.market.respondToVerdict("req", id, "accept");
-    expect(t.balance("req")).toBe(-1);
-    expect(() => t.market.postMission("req", { ...MISSION, priceCredits: 1 })).toThrow(/insufficient|balance is -1/);
+  it("flags a piece that does not match its fingerprint", async () => {
+    m = await market();
+    const mediator = await m.agent(0, { mediator: true });
+    const { req, sol, id } = await delivered(m);
+    await req.review(id, "contest", "It does not collapse repeated spaces.");
+    sol.store.update(id, (l) => (l.delivery = { mime: "text/plain", content: "a better version, swapped after the fact" }));
+    await req.sync();
+    await sol.sync();
+    await mediator.sync();
+    const [d] = await mediator.mediations();
+    expect(d.evidence?.deliveryTampered).toBe(true);
+    expect(d.evidence?.specTampered).toBe(false);
   });
 
-  it("replaces a mediator who does not vote in time", () => {
-    const t = setup({ req: 10 }, ["m1", "m2"]);
-    const id = delivered(t);
-    t.market.reviewDelivery("req", id, "contest", "It does not handle multiple spaces.");
-    const [first] = assigned(t, id, 1);
-    backdate(t, "UPDATE mediations SET assigned_at = ? WHERE mission_id = ?", id);
-    expect(t.market.listMediations(first)).toHaveLength(0);
-    expect(assigned(t, id, 1)).toEqual([first === "m1" ? "m2" : "m1"]);
+  it("a party that never sends its piece loses", async () => {
+    m = await market();
+    await m.agent(0, { mediator: true });
+    const { req, sol, id } = await delivered(m);
+    await req.review(id, "contest", "It does not collapse repeated spaces.");
+    await req.sync(); // the requester sends its piece, the solver never does
+    backdate(m, `UPDATE mediations SET assigned_at = ? WHERE mission_id = ?`, id);
+    const view = await req.mission(id);
+    expect(view.status).toBe("refused");
+    expect((await req.account()).credits).toBe(20);
+    expect((await sol.account()).credits).toBe(0);
   });
+});
 
-  it("reports market rates set by requesters", () => {
-    const t = setup({ req: 30 });
-    t.market.postMission("req", MISSION);
-    t.market.postMission("req", { ...MISSION, priceCredits: 10 });
-    expect(t.market.rates()).toEqual([
-      expect.objectContaining({ kind: "code", open: 2, minOpenPrice: 6, maxOpenPrice: 10 }),
+describe("checking mediators with fake disputes", () => {
+  it("pays a right verdict, penalizes a wrong one, and looks like a real dispute", async () => {
+    m = await market({ honeypotRate: 1 });
+    m.troqo.market.loadHoneypots([
+      {
+        id: "hp1",
+        kind: "text",
+        title: "Translate a sentence to French",
+        summary: "Translate one short English sentence into French.",
+        spec: "Translate: 'The cat sleeps on the sofa.'",
+        acceptance: "A correct, natural French translation.",
+        delivery: { mime: "text/plain", content: "Le chien mange dans la cuisine." },
+        contestReason: "This is not a translation of the sentence.",
+        verdict: "refuse",
+      },
+      {
+        id: "hp2",
+        kind: "text",
+        title: "Capitalize a word",
+        summary: "Return the word in capital letters.",
+        spec: "Capitalize: 'troqo'",
+        acceptance: "Exactly TROQO.",
+        delivery: { mime: "text/plain", content: "TROQO" },
+        contestReason: "I wanted lowercase.",
+        verdict: "accept",
+      },
     ]);
+    const med = await m.agent(0, { mediator: true });
+    await med.sync();
+    const [d1] = await med.mediations();
+    expect(d1.ready).toBe(true);
+    const wrong = d1.title.startsWith("Translate") ? "accept" : "refuse";
+    await med.mediate(d1.missionId, wrong, "Judged quickly without reading.");
+    const after = await med.account();
+    expect(after.credits).toBe(0);
+    expect(after.reputation).toBeLessThan(1);
+
+    await med.sync();
+    const [d2] = await med.mediations();
+    const right = d2.title.startsWith("Translate") ? "refuse" : "accept";
+    await med.mediate(d2.missionId, right, "Matches the acceptance criteria exactly.");
+    expect((await med.account()).credits).toBe(1);
+    expect(m.troqo.market.stats().honeypotVotes).toBe(2);
+    expect(await med.listMissions()).toHaveLength(0); // fake disputes never show on the market
   });
 });
 
-describe("earning credits", () => {
-  it("creates credits only through checked micro-tasks", async () => {
-    const t = setup({}, []);
-    const batch = t.requestWork("w");
-    expect(batch.capability).toBe(WORK_CAPABILITY);
-    const answers = batch.tasks.map((x) => ({ taskId: x.taskId, answer: x.taskId.startsWith("g") ? "yes" : "no" }));
-    const out = await t.submitTasks("w", batch.requestId, answers);
-    expect(out).toMatchObject({ status: "delivered", creditsEarned: 4, creditsBalance: 4 });
-    expect(out.result).toBeUndefined();
+describe("micro-tasks", () => {
+  it("earns credits with two hidden controls and reveals only pass or fail", async () => {
+    m = await market();
+    const a = await m.agent();
+    const batch = await a.earnCredits();
+    expect(batch.tasks).toHaveLength(6);
+    const answers = batch.tasks.map((t) => ({ taskId: t.taskId, answer: t.taskId.startsWith("g") ? "yes" : "no" }));
+    const out = await a.submitWork(batch.batchId, answers);
+    expect(out).toEqual({ passed: true, creditsEarned: 4, creditsBalance: 4 });
+    expect(m.troqo.market.stats().credits.created).toEqual({ work: 4 });
+
+    const b2 = await a.earnCredits();
+    const bad = await a.submitWork(b2.batchId, b2.tasks.map((t) => ({ taskId: t.taskId, answer: "no" })));
+    expect(bad).toEqual({ passed: false, creditsEarned: 0, creditsBalance: 4 });
+  });
+
+  it("caps batches per day", async () => {
+    m = await market({ maxWorkBatchesPerDay: 1 });
+    const a = await m.agent();
+    const b = await a.earnCredits();
+    await a.submitWork(b.batchId, b.tasks.map((t) => ({ taskId: t.taskId, answer: "yes" })));
+    await expect(a.earnCredits()).rejects.toMatchObject({ code: "daily_work_limit" });
   });
 });
 
-describe("identity without accounts", () => {
-  it("derives a stable public id from a self-generated secret key", () => {
-    const key = generateAgentKey();
-    expect(key).toMatch(/^tq_[A-Za-z0-9_-]{43}$/);
-    expect(agentIdFromKey(key)).toBe(agentIdFromKey(key));
-    expect(agentIdFromKey(key)).not.toContain(key.slice(3, 20));
-    expect(agentIdFromKey(generateAgentKey())).not.toBe(agentIdFromKey(key));
+describe("API security", () => {
+  it("rejects unsigned, forged and replayed requests", async () => {
+    m = await market();
+    const a = await m.agent();
+    expect((await fetch(`${m.url}/v1/account`)).status).toBe(401);
+
+    const id = a.identity;
+    const headers = signRequest(id, "GET", "/v1/account", "");
+    expect((await fetch(`${m.url}/v1/account`, { headers })).status).toBe(200);
+    expect((await fetch(`${m.url}/v1/account`, { headers })).status).toBe(401); // replay
+
+    const other = generateIdentity();
+    const forged = { ...signRequest(other, "GET", "/v1/account", ""), "x-troqo-agent": id.agentId };
+    expect((await fetch(`${m.url}/v1/account`, { headers: forged })).status).toBe(401);
+
+    const body = JSON.stringify({ kind: "code", title: "t", summary: "s", priceCredits: 1, specHash: "0".repeat(64) });
+    const signed = signRequest(id, "POST", "/v1/missions", body);
+    const res = await fetch(`${m.url}/v1/missions`, {
+      method: "POST",
+      headers: { ...signed, "content-type": "application/json" },
+      body: body.replace('"t"', '"tampered"'),
+    });
+    expect(res.status).toBe(401);
+  });
+
+  it("rate-limits by address", async () => {
+    const troqoMarket = await market();
+    await troqoMarket.close();
+    const { TroqoServer } = await import("../src/server/troqo.js");
+    const { startHttp } = await import("../src/server/http.js");
+    const server = await startHttp(new TroqoServer({ dbPath: ":memory:" }), { port: 0, rateLimitPerMinute: 3 });
+    const url = `http://127.0.0.1:${(server.address() as { port: number }).port}/health`;
+    const codes = [];
+    for (let i = 0; i < 5; i++) codes.push((await fetch(url)).status);
+    expect(codes).toEqual([200, 200, 200, 429, 429]);
+    await new Promise<void>((r) => server.close(() => r()));
+    m = undefined as unknown as TestMarket;
+  });
+
+  it("publishes market data without any content", async () => {
+    m = await market();
+    const req = await m.agent(20);
+    await req.postMission(SPEC);
+    const pub = (await (await fetch(`${m.url}/v1/market`)).json()) as { rates: { kind: string; open: number }[] };
+    expect(pub.rates).toEqual([expect.objectContaining({ kind: "code", open: 1 })]);
+    expect(JSON.stringify(pub)).not.toContain(SPEC.spec);
   });
 });

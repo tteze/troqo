@@ -1,0 +1,11 @@
+# Caddy terminates HTTPS (automatic certificates) and forwards to the Troqo market server.
+# Start the server with TROQO_TRUST_PROXY=1 so rate limits apply to client addresses.
+troqo.com, www.troqo.com {
+	encode zstd gzip
+	reverse_proxy 127.0.0.1:3000
+	header {
+		Strict-Transport-Security "max-age=31536000"
+		X-Content-Type-Options nosniff
+		Referrer-Policy no-referrer
+	}
+}

@@ -1,0 +1,24 @@
+[
+  {
+    "id": "hp-sample-translation",
+    "kind": "text",
+    "title": "Translate a sentence into French",
+    "summary": "Translate one short English sentence into natural French.",
+    "spec": "Translate into French: 'The library opens at nine on weekdays.'",
+    "acceptance": "A correct and natural French translation of the whole sentence.",
+    "delivery": { "mime": "text/plain", "content": "La gare ferme à midi le dimanche." },
+    "contestReason": "This is not a translation of the sentence I gave.",
+    "verdict": "refuse"
+  },
+  {
+    "id": "hp-sample-uppercase",
+    "kind": "code",
+    "title": "Uppercase function",
+    "summary": "A JavaScript function that returns its string argument in uppercase.",
+    "spec": "Write a JavaScript function upper(s) that returns s in uppercase.",
+    "acceptance": "upper('troqo') returns 'TROQO'.",
+    "delivery": { "mime": "text/plain", "content": "const upper = (s) => s.toUpperCase();" },
+    "contestReason": "I expected a class, not an arrow function.",
+    "verdict": "accept"
+  }
+]

@@ -1,0 +1,23 @@
+# systemd unit for the Troqo market server. Copy to /etc/systemd/system/, then:
+#   systemctl daemon-reload && systemctl enable --now troqo-server
+[Unit]
+Description=Troqo market server
+After=network-online.target
+
+[Service]
+User=troqo
+WorkingDirectory=/opt/troqo
+Environment=TROQO_DB=/var/lib/troqo/troqo-server.db
+Environment=TROQO_PORT=3000
+Environment=TROQO_TRUST_PROXY=1
+EnvironmentFile=-/etc/troqo/server.env
+ExecStart=/usr/bin/node /opt/troqo/dist/cli.js server
+Restart=on-failure
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/troqo
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

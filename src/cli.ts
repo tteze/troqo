@@ -1,98 +1,164 @@
 #!/usr/bin/env node
-import { readFileSync, existsSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { spawnSync } from "node:child_process";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
-import { Troqo } from "./engine.js";
-import { agentIdFromKey, generateAgentKey, parseAgentKeys, startHttp } from "./http.js";
-import { providersFromEnv } from "./providers.js";
-import { buildServer } from "./server.js";
-import type { TaskDefinition } from "./types.js";
+import { TroqoClient } from "./client/client.js";
+import { DEFAULT_SERVER, loadConfig, loadIdentity, saveConfig, troqoHome } from "./client/config.js";
+import { startEgressProxy } from "./client/egress-proxy.js";
+import { buildMcpServer, VERSION } from "./client/mcp.js";
+import { sandboxSetupCommands } from "./client/sandbox.js";
+import { Worker, type WorkerConfig } from "./client/worker.js";
+import { startHttp } from "./server/http.js";
+import type { HoneypotDefinition } from "./server/market.js";
+import { TroqoServer } from "./server/troqo.js";
+import type { TaskDefinition } from "./server/work.js";
 
 const env = process.env;
-const SAMPLE_TASKS = join(dirname(fileURLToPath(import.meta.url)), "..", "data", "tasks.sample.json");
+const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
 
-const USAGE = `troqo <command>
+const USAGE = `troqo ${VERSION}: a market where AI agents pay each other with work instead of money.
 
-Commands:
-  stdio            Run the MCP server over stdio (default). Agent id: TROQO_AGENT_ID (default "local").
-  http             Run the MCP server over HTTP at /mcp. Requires TROQO_AGENT_KEYS="token:agentId,...".
-  key              Generate a secret agent key (no account needed on servers with TROQO_OPEN_ACCESS=1).
-  load <file.json> Load or update micro-tasks from a JSON file.
-  stats            Print metrics (pass rate, tokens per batch, spend, resolved tasks).
-  export           Print resolved tasks (the work product) as JSON.
+Agent side (your machine):
+  init [--server URL]   Create your keys in ${troqoHome()} and set the market (default ${DEFAULT_SERVER}).
+  whoami                Print your agent id and market.
+  account               Print your balance and reputation.
+  mcp                   Run the MCP server your agent connects to (stdio).
+  worker [--once]       Solve missions and mediate in the background (see "worker" in config.json).
+  sandbox setup [--run] Docker network and egress proxy for the worker sandbox (prints, or runs with --run).
+  egress-proxy --allow host1,host2 [--port 3128]   HTTPS proxy limited to the allowed hosts.
 
-Environment: TROQO_DB, TROQO_MAX_SPEND_USD, TROQO_GOLD_PER_BATCH, TROQO_REQUEST_TTL_MINUTES, TROQO_PORT, TROQO_HOST,
-TROQO_PUBLIC_URL, TROQO_ADMIN_TOKEN, TROQO_OPEN_ACCESS, TROQO_AGENT_KEYS, TROQO_IMAGE_API_KEY (+ _BASE_URL, _MODEL, _SIZE, _COST_USD, _PRICE_CREDITS).`;
+Market server (operator):
+  server                Run the market server, website and API docs. Env: TROQO_DB, TROQO_PORT, TROQO_HOST,
+                        TROQO_ADMIN_TOKEN, TROQO_TRUST_PROXY=1.
+  load <tasks.json>     Load micro-tasks (with hidden gold answers) into the server database.
+  honeypots <file.json> Load fake disputes used to check mediators.
+  stats | export        Metrics, or the micro-task work product, from the server database.`;
 
-function engineFromEnv(): Troqo {
-  const engine = new Troqo(
-    {
-      dbPath: env.TROQO_DB ?? "troqo.db",
-      maxSpendUsd: env.TROQO_MAX_SPEND_USD ? Number(env.TROQO_MAX_SPEND_USD) : undefined,
-      goldPerBatch: env.TROQO_GOLD_PER_BATCH ? Number(env.TROQO_GOLD_PER_BATCH) : undefined,
-      requestTtlMinutes: env.TROQO_REQUEST_TTL_MINUTES ? Number(env.TROQO_REQUEST_TTL_MINUTES) : undefined,
-    },
-    providersFromEnv(env),
-  );
-  // Seed with the sample bank on first run so the loop works out of the box.
-  const count = engine.db.prepare("SELECT COUNT(*) AS n FROM tasks").get() as { n: number };
-  if (count.n === 0 && existsSync(SAMPLE_TASKS)) {
-    engine.loadTasks(JSON.parse(readFileSync(SAMPLE_TASKS, "utf8")) as TaskDefinition[]);
-    console.error(`troqo: seeded task bank from ${SAMPLE_TASKS}`);
-  }
-  return engine;
+function flag(args: string[], name: string): string | undefined {
+  const i = args.indexOf(name);
+  return i >= 0 ? args[i + 1] : undefined;
 }
 
+function client() {
+  const home = troqoHome();
+  return new TroqoClient(loadConfig(home).server, loadIdentity(home), home);
+}
+
+function serverFromEnv() {
+  const s = new TroqoServer({ dbPath: env.TROQO_DB ?? "troqo-server.db" });
+  if (s.work.taskCount() === 0) {
+    const sample = join(ROOT, "data", "tasks.sample.json");
+    if (existsSync(sample)) {
+      s.work.loadTasks(JSON.parse(readFileSync(sample, "utf8")) as TaskDefinition[]);
+      console.error(`troqo: seeded the micro-task bank from ${sample}`);
+    }
+    const pots = join(ROOT, "data", "honeypots.sample.json");
+    if (existsSync(pots)) s.market.loadHoneypots(JSON.parse(readFileSync(pots, "utf8")) as HoneypotDefinition[]);
+  }
+  return s;
+}
+
+const DEFAULT_WORKER: WorkerConfig = {
+  kinds: ["text", "code"],
+  minPrice: {},
+  maxConcurrent: 1,
+  pollSeconds: 30,
+  mediate: true,
+  solver: { command: ["claude", "-p"], sandbox: "docker", docker: { mounts: [], env: ["ANTHROPIC_API_KEY"] }, timeoutSeconds: 600 },
+};
+
 async function main() {
-  const [command = "stdio", arg] = process.argv.slice(2);
+  const [command = "help", ...args] = process.argv.slice(2);
   switch (command) {
-    case "stdio": {
-      const engine = engineFromEnv();
-      const agentId = env.TROQO_AGENT_ID ?? "local";
-      await buildServer(engine, () => agentId, { publicUrl: env.TROQO_PUBLIC_URL }).connect(
-        new StdioServerTransport(),
-      );
-      console.error(`troqo: MCP server on stdio (agent "${agentId}")`);
+    case "init": {
+      const home = troqoHome();
+      const id = loadIdentity(home);
+      const current = loadConfig(home);
+      saveConfig({ server: flag(args, "--server") ?? current.server, worker: current.worker ?? DEFAULT_WORKER }, home);
+      console.log(`Agent ${id.agentId}\nKeys and settings in ${home} (keep identity.json private).\nMarket: ${loadConfig(home).server}`);
       break;
     }
-    case "http": {
-      const engine = engineFromEnv();
+    case "whoami": {
+      const home = troqoHome();
+      console.log(`${loadIdentity(home).agentId} on ${loadConfig(home).server}`);
+      break;
+    }
+    case "account":
+      console.log(JSON.stringify(await client().account(), null, 2));
+      break;
+    case "mcp": {
+      const c = client();
+      await buildMcpServer(c, { backgroundSyncSeconds: 30 }).connect(new StdioServerTransport());
+      console.error(`troqo: MCP server for agent ${c.agentId} on ${c.api.server}`);
+      break;
+    }
+    case "worker": {
+      const home = troqoHome();
+      const config = loadConfig(home).worker;
+      if (!config) throw new Error(`No "worker" section in ${join(home, "config.json")}: run troqo init`);
+      const w = new Worker(client(), config, (e) => console.log(`${new Date().toISOString()} ${JSON.stringify(e)}`));
+      if (args.includes("--once")) await w.tick();
+      else {
+        process.on("SIGINT", () => w.stop());
+        process.on("SIGTERM", () => w.stop());
+        await w.run();
+      }
+      break;
+    }
+    case "sandbox": {
+      const worker = loadConfig().worker;
+      const allow = (flag(args, "--allow") ?? "api.anthropic.com,api.openai.com").split(",");
+      const cmds = sandboxSetupCommands(allow, worker?.solver?.docker);
+      for (const c of cmds) {
+        console.log(c.join(" "));
+        if (args.includes("--run")) {
+          const r = spawnSync(c[0], c.slice(1), { stdio: "inherit" });
+          if (r.status !== 0) throw new Error(`Failed: ${c.join(" ")}`);
+        }
+      }
+      break;
+    }
+    case "egress-proxy": {
+      const allow = (flag(args, "--allow") ?? "").split(",").filter(Boolean);
+      if (!allow.length) throw new Error("--allow host1,host2 is required");
+      const port = Number(flag(args, "--port") ?? 3128);
+      await startEgressProxy(port, allow);
+      console.error(`troqo: egress proxy on :${port}, allowing ${allow.join(", ")}`);
+      break;
+    }
+    case "server": {
+      const s = serverFromEnv();
       const port = Number(env.TROQO_PORT ?? 3000);
-      await startHttp(engine, {
+      await startHttp(s, {
         port,
         host: env.TROQO_HOST,
-        agentKeys: parseAgentKeys(env.TROQO_AGENT_KEYS),
-        openAccess: env.TROQO_OPEN_ACCESS === "1",
         adminToken: env.TROQO_ADMIN_TOKEN,
-        publicUrl: env.TROQO_PUBLIC_URL,
+        trustProxy: env.TROQO_TRUST_PROXY === "1",
       });
-      console.error(`troqo: MCP server on http://${env.TROQO_HOST ?? "127.0.0.1"}:${port}/mcp`);
-      break;
-    }
-    case "key": {
-      // No account, no sign-up: the agent's identity is a secret key generated here.
-      const key = generateAgentKey();
-      console.log(key);
-      console.error(
-        `troqo: new agent key (public id ${agentIdFromKey(key)}). Keep it secret: it holds your credits.\n` +
-          `Use it as "Authorization: Bearer <key>" against a server started with TROQO_OPEN_ACCESS=1.`,
-      );
+      console.error(`troqo: market server on http://${env.TROQO_HOST ?? "127.0.0.1"}:${port}`);
       break;
     }
     case "load": {
-      if (!arg) throw new Error("Usage: troqo load <file.json>");
-      const engine = engineFromEnv();
-      const n = engine.loadTasks(JSON.parse(readFileSync(resolve(arg), "utf8")) as TaskDefinition[]);
-      console.log(`Loaded ${n} tasks`);
-      engine.close();
+      if (!args[0]) throw new Error("Usage: troqo load <tasks.json>");
+      const s = serverFromEnv();
+      console.log(`Loaded ${s.work.loadTasks(JSON.parse(readFileSync(resolve(args[0]), "utf8")))} tasks`);
+      s.close();
+      break;
+    }
+    case "honeypots": {
+      if (!args[0]) throw new Error("Usage: troqo honeypots <file.json>");
+      const s = serverFromEnv();
+      console.log(`Loaded ${s.market.loadHoneypots(JSON.parse(readFileSync(resolve(args[0]), "utf8")))} honeypots`);
+      s.close();
       break;
     }
     case "stats":
     case "export": {
-      const engine = engineFromEnv();
-      console.log(JSON.stringify(command === "stats" ? engine.stats() : engine.resolvedTasks(), null, 2));
-      engine.close();
+      const s = serverFromEnv();
+      console.log(JSON.stringify(command === "stats" ? s.stats() : s.work.resolvedTasks(), null, 2));
+      s.close();
       break;
     }
     default:
