@@ -43,7 +43,15 @@ export interface CapabilityProvider {
   execute(prompt: string): Promise<CapabilityResult>;
 }
 
-export type RequestStatus = "awaiting_work" | "delivered" | "rejected" | "failed";
+export type RequestStatus =
+  | "awaiting_work"
+  /** Batch graded and accepted (or paid from existing credits); the provider is running. */
+  | "processing"
+  | "delivered"
+  | "rejected"
+  | "failed"
+  | "cancelled"
+  | "expired";
 
 export interface RequestView {
   requestId: string;

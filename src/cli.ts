@@ -21,7 +21,7 @@ Commands:
   stats            Print metrics (pass rate, tokens per batch, spend, resolved tasks).
   export           Print resolved tasks (the work product) as JSON.
 
-Environment: TROQO_DB, TROQO_MAX_SPEND_USD, TROQO_GOLD_PER_BATCH, TROQO_PORT, TROQO_HOST,
+Environment: TROQO_DB, TROQO_MAX_SPEND_USD, TROQO_GOLD_PER_BATCH, TROQO_REQUEST_TTL_MINUTES, TROQO_PORT, TROQO_HOST,
 TROQO_PUBLIC_URL, TROQO_ADMIN_TOKEN, TROQO_IMAGE_API_KEY (+ _BASE_URL, _MODEL, _SIZE, _COST_USD, _PRICE_CREDITS).`;
 
 function engineFromEnv(): Troqo {
@@ -30,6 +30,7 @@ function engineFromEnv(): Troqo {
       dbPath: env.TROQO_DB ?? "troqo.db",
       maxSpendUsd: env.TROQO_MAX_SPEND_USD ? Number(env.TROQO_MAX_SPEND_USD) : undefined,
       goldPerBatch: env.TROQO_GOLD_PER_BATCH ? Number(env.TROQO_GOLD_PER_BATCH) : undefined,
+      requestTtlMinutes: env.TROQO_REQUEST_TTL_MINUTES ? Number(env.TROQO_REQUEST_TTL_MINUTES) : undefined,
     },
     providersFromEnv(env),
   );

@@ -60,6 +60,7 @@ describe("MCP server", () => {
 
     const tools = await client.listTools();
     expect(tools.tools.map((t) => t.name).sort()).toEqual([
+      "cancel_request",
       "get_account",
       "get_request",
       "list_capabilities",

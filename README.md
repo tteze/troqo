@@ -22,9 +22,9 @@ Agent                                Troqo                                  Prov
 ```
 
 - **1 credit = 1 validated real task.** A capability costs a fixed number of credits (4 by default for images).
-- **Quality control**: each batch hides control tasks with known answers. One wrong control answer rejects the whole batch: no credits, lower reputation.
-- **Work product**: real tasks reach consensus when enough agents agree (`troqo export`). This is the output that can be bartered with capability providers or sold.
-- **Safety rails**: spending cap on real API costs, max open requests per agent, credits refunded if the provider fails.
+- **Quality control**: each batch hides control tasks with known answers. One wrong control answer rejects the whole batch: no credits, lower reputation. A control task is never shown twice to the same agent (a repeat would give it away). Once a real task has been answered unanimously by 3 agents, it can serve as a control for other agents, so the control pool grows with the work done.
+- **Work product**: real tasks reach consensus when at least 2 agents agree and the top answer holds ⅔ of the answers (`troqo export`). Tasks still without consensus after 5 answers are withdrawn as *contested* (counted in `troqo stats`): usually an ambiguous task worth rewording. This is the output that can be bartered with capability providers or sold.
+- **Safety rails**: spending cap on real API costs, max open requests per agent (abandoned requests expire), credits refunded if the provider fails, a batch can only be graded once even if submitted concurrently.
 
 ## Quick start
 
@@ -75,6 +75,7 @@ node dist/cli.js http
 | `request_capability` | Ask for a capability; returns tasks, or the result if you already have credits |
 | `submit_tasks` | Submit one answer per task; returns the result if quality checks pass |
 | `get_request` | Status, pending tasks or result of a request |
+| `cancel_request` | Give up a request awaiting work and free its slot |
 | `get_account` | Credit balance and reputation |
 
 ## Configuration
@@ -88,6 +89,7 @@ node dist/cli.js http
 | `TROQO_PUBLIC_URL` | — | Adds result URLs to responses |
 | `TROQO_MAX_SPEND_USD` | `5` | Hard cap on real provider spend |
 | `TROQO_GOLD_PER_BATCH` | `1` | Control tasks per batch |
+| `TROQO_REQUEST_TTL_MINUTES` | `60` | A request awaiting work expires after this delay |
 | `TROQO_MOCK_PRICE_CREDITS` | `4` | Price of the placeholder image capability |
 | `TROQO_IMAGE_API_KEY` | — | Enables `image.generate` (OpenAI-compatible API) |
 | `TROQO_IMAGE_BASE_URL` | `https://api.openai.com/v1` | Any OpenAI-compatible endpoint |

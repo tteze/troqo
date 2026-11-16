@@ -18,6 +18,19 @@ export interface TroqoConfig {
   goldPassRatio: number;
   /** Number of agreeing accepted answers needed to consider a task resolved. */
   minAgreement: number;
+  /** Share of accepted answers the top answer must hold for a task to be resolved (0–1). */
+  consensusRatio: number;
+  /** A task with this many accepted answers and still no consensus is "contested" and no longer handed out. */
+  maxAnswersPerTask: number;
+  /**
+   * A resolved task whose accepted answers are unanimous with at least this many votes can serve as a
+   * control task for agents who never saw it. Keeps the control pool growing with the work done.
+   */
+  consensusGoldMinVotes: number;
+  /** Minutes before a request awaiting work expires and frees its slot. */
+  requestTtlMinutes: number;
+  /** Minutes after which a request stuck in "processing" (server crash) is failed and refunded. */
+  processingTimeoutMinutes: number;
   /** Max requests awaiting work per agent, to prevent hoarding tasks. */
   maxOpenRequestsPerAgent: number;
   /** Hard cap on real money spent at capability providers, in USD. */
@@ -29,6 +42,11 @@ export const DEFAULT_CONFIG: TroqoConfig = {
   goldPerBatch: 1,
   goldPassRatio: 1,
   minAgreement: 2,
+  consensusRatio: 2 / 3,
+  maxAnswersPerTask: 5,
+  consensusGoldMinVotes: 3,
+  requestTtlMinutes: 60,
+  processingTimeoutMinutes: 10,
   maxOpenRequestsPerAgent: 3,
   maxSpendUsd: 5,
 };
@@ -61,6 +79,11 @@ interface TaskRow {
   gold: string | null;
 }
 
+/** A task as placed in a batch: `expected` is set when it serves as a control. */
+interface BatchRow extends TaskRow {
+  expected: string | null;
+}
+
 interface RequestRow {
   id: string;
   agent_id: string;
@@ -74,6 +97,15 @@ interface RequestRow {
 }
 
 const now = () => new Date().toISOString();
+const minutesAgo = (m: number) => new Date(Date.now() - m * 60_000).toISOString();
+
+/** Accepted votes per task: top answer count and total. */
+const VOTES_SQL = `SELECT task_id, MAX(n) AS top, SUM(n) AS total FROM (
+  SELECT task_id, answer, COUNT(*) AS n FROM answers WHERE accepted = 1 GROUP BY task_id, answer
+) GROUP BY task_id`;
+
+/** Tasks already handed to a given agent (any request, any status). */
+const SEEN_SQL = `SELECT a.task_id FROM assignments a JOIN requests r ON r.id = a.request_id WHERE r.agent_id = ?`;
 const approxTokens = (text: string) => Math.ceil(text.length / 4);
 
 function shuffle<T>(items: T[]): T[] {
@@ -101,7 +133,9 @@ export class Troqo {
   private readonly providers = new Map<string, CapabilityProvider>();
 
   constructor(config: Partial<TroqoConfig> = {}, providers: CapabilityProvider[] = []) {
-    this.config = { ...DEFAULT_CONFIG, ...config };
+    // Ignore keys explicitly set to undefined (e.g. unset env vars) so they don't erase the defaults.
+    const defined = Object.fromEntries(Object.entries(config).filter(([, v]) => v !== undefined));
+    this.config = { ...DEFAULT_CONFIG, ...defined };
     this.db = openDb(this.config.dbPath);
     for (const p of providers) this.providers.set(p.id, p);
   }
@@ -129,34 +163,73 @@ export class Troqo {
   }
 
   /**
-   * Real tasks this agent has never seen, least-answered first, skipping tasks already resolved.
+   * Real tasks this agent has never seen, least-answered first, skipping tasks that are resolved
+   * (consensus reached) or contested (too many answers without consensus).
    */
-  private pickRealTasks(agentId: string, count: number): TaskRow[] {
+  private pickRealTasks(agentId: string, count: number): BatchRow[] {
+    const { minAgreement, consensusRatio, maxAnswersPerTask } = this.config;
     return this.db
       .prepare(
-        `SELECT t.* FROM tasks t
+        `SELECT t.*, NULL AS expected FROM tasks t
          WHERE t.gold IS NULL
-           AND t.id NOT IN (SELECT a.task_id FROM assignments a JOIN requests r ON r.id = a.request_id
-                            WHERE r.agent_id = ?)
-           AND t.id NOT IN (SELECT task_id FROM answers WHERE accepted = 1
-                            GROUP BY task_id, answer HAVING COUNT(*) >= ?)
+           AND t.id NOT IN (${SEEN_SQL})
+           AND t.id NOT IN (SELECT task_id FROM (${VOTES_SQL})
+                            WHERE (top >= ? AND top >= ? * total - 1e-9) OR total >= ?)
          ORDER BY (SELECT COUNT(*) FROM answers an WHERE an.task_id = t.id AND an.accepted = 1), RANDOM()
          LIMIT ?`,
       )
-      .all(agentId, this.config.minAgreement, count) as unknown as TaskRow[];
+      .all(agentId, minAgreement, consensusRatio, maxAnswersPerTask, count) as unknown as BatchRow[];
   }
 
-  /** Control tasks, preferring ones this agent has not seen yet. */
-  private pickGoldTasks(agentId: string, count: number): TaskRow[] {
+  /**
+   * Control tasks this agent has never seen. A control is never shown twice to the same agent: since real
+   * tasks are never repeated either, a repeated task would betray itself as a control.
+   * Explicit gold tasks come first, then real tasks resolved unanimously by other agents.
+   */
+  private pickGoldTasks(agentId: string, count: number): BatchRow[] {
+    const minVotes = Math.max(this.config.consensusGoldMinVotes, this.config.minAgreement);
     return this.db
       .prepare(
-        `SELECT t.* FROM tasks t
-         WHERE t.gold IS NOT NULL
-         ORDER BY (t.id IN (SELECT a.task_id FROM assignments a JOIN requests r ON r.id = a.request_id
-                            WHERE r.agent_id = ?)), RANDOM()
+        `SELECT * FROM (
+           SELECT t.*, t.gold AS expected, 0 AS derived FROM tasks t WHERE t.gold IS NOT NULL
+           UNION ALL
+           SELECT t.*, v.answer AS expected, 1 AS derived FROM tasks t
+           JOIN (SELECT task_id, answer, COUNT(*) AS n FROM answers WHERE accepted = 1
+                 GROUP BY task_id, answer) v ON v.task_id = t.id
+           WHERE t.gold IS NULL AND v.n >= ?
+             AND v.n = (SELECT COUNT(*) FROM answers x WHERE x.task_id = t.id AND x.accepted = 1)
+         ) c
+         WHERE c.id NOT IN (${SEEN_SQL})
+         ORDER BY c.derived, RANDOM()
          LIMIT ?`,
       )
-      .all(agentId, count) as unknown as TaskRow[];
+      .all(minVotes, agentId, count) as unknown as BatchRow[];
+  }
+
+  /** Expires abandoned requests and recovers requests stuck in processing after a crash (with refund). */
+  private sweep() {
+    tx(this.db, () => {
+      this.db
+        .prepare(
+          `UPDATE requests SET status = 'expired', completed_at = ?, error = ?
+           WHERE status = 'awaiting_work' AND created_at < ?`,
+        )
+        .run(now(), `Not completed within ${this.config.requestTtlMinutes} minutes`, minutesAgo(this.config.requestTtlMinutes));
+      const stuck = this.db
+        .prepare(`SELECT id, agent_id, price_credits FROM requests WHERE status = 'processing' AND created_at < ?`)
+        // Processing starts at most requestTtlMinutes after creation.
+        .all(minutesAgo(this.config.requestTtlMinutes + this.config.processingTimeoutMinutes)) as {
+        id: string;
+        agent_id: string;
+        price_credits: number;
+      }[];
+      for (const r of stuck) {
+        this.db
+          .prepare(`UPDATE requests SET status = 'failed', completed_at = ?, error = ? WHERE id = ?`)
+          .run(now(), "Interrupted while processing; credits refunded", r.id);
+        this.db.prepare(`UPDATE ledger SET credits = credits + ? WHERE agent_id = ?`).run(r.price_credits, r.agent_id);
+      }
+    });
   }
 
   // ---------------------------------------------------------------- capabilities
@@ -189,6 +262,7 @@ export class Troqo {
     if (!prompt.trim()) throw new TroqoError("invalid_prompt", "Prompt is empty");
     if (prompt.length > 2000) throw new TroqoError("invalid_prompt", "Prompt exceeds 2000 characters");
     this.ensureAgent(agentId);
+    this.sweep();
 
     const requestId = randomUUID();
     const balance = this.balance(agentId);
@@ -197,7 +271,7 @@ export class Troqo {
       this.db
         .prepare(
           `INSERT INTO requests (id, agent_id, capability, prompt, status, price_credits, created_at)
-           VALUES (?, ?, ?, ?, 'awaiting_work', ?, ?)`,
+           VALUES (?, ?, ?, ?, 'processing', ?, ?)`,
         )
         .run(requestId, agentId, capability, prompt, provider.priceCredits, now());
       const outcome = await this.payAndExecute(requestId, agentId, provider, prompt, 0, 0, 0);
@@ -229,8 +303,10 @@ export class Troqo {
            VALUES (?, ?, ?, ?, 'awaiting_work', ?, ?)`,
         )
         .run(requestId, agentId, capability, prompt, provider.priceCredits, now());
-      const ins = this.db.prepare(`INSERT INTO assignments (request_id, task_id, position) VALUES (?, ?, ?)`);
-      batch.forEach((t, i) => ins.run(requestId, t.id, i));
+      const ins = this.db.prepare(
+        `INSERT INTO assignments (request_id, task_id, position, expected) VALUES (?, ?, ?, ?)`,
+      );
+      batch.forEach((t, i) => ins.run(requestId, t.id, i, t.expected));
     });
 
     return { request: this.getRequest(agentId, requestId) };
@@ -238,6 +314,7 @@ export class Troqo {
 
   /** Grades a batch, credits the agent, then executes the capability if the batch passed. */
   async submitTasks(agentId: string, requestId: string, answers: TaskAnswer[]): Promise<SubmitOutcome> {
+    this.sweep();
     const req = this.requestRow(agentId, requestId);
     if (req.status !== "awaiting_work") {
       throw new TroqoError("request_closed", `Request is already ${req.status}`);
@@ -246,10 +323,10 @@ export class Troqo {
 
     const tasks = this.db
       .prepare(
-        `SELECT t.* FROM assignments a JOIN tasks t ON t.id = a.task_id
+        `SELECT t.*, a.expected FROM assignments a JOIN tasks t ON t.id = a.task_id
          WHERE a.request_id = ? ORDER BY a.position`,
       )
-      .all(requestId) as unknown as TaskRow[];
+      .all(requestId) as unknown as BatchRow[];
 
     // Validate: one answer per assigned task, each answer among the options (case-insensitive).
     const byTask = new Map(answers.map((a) => [a.taskId, a.answer]));
@@ -267,8 +344,8 @@ export class Troqo {
     const unknown = answers.find((a) => !tasks.some((t) => t.id === a.taskId));
     if (unknown) throw new TroqoError("unknown_task", `Task ${unknown.taskId} is not part of this request`);
 
-    const goldTasks = tasks.filter((t) => t.gold !== null);
-    const goldCorrect = goldTasks.filter((t) => normalized.get(t.id) === t.gold).length;
+    const goldTasks = tasks.filter((t) => t.expected !== null);
+    const goldCorrect = goldTasks.filter((t) => normalized.get(t.id) === t.expected).length;
     const passed = goldTasks.length === 0 || goldCorrect / goldTasks.length >= this.config.goldPassRatio;
     const realCount = tasks.length - goldTasks.length;
     const tokens = tasks.reduce(
@@ -277,6 +354,11 @@ export class Troqo {
     );
 
     tx(this.db, () => {
+      // Atomic claim: a concurrent submission of the same request finds it no longer awaiting work.
+      const claimed = this.db
+        .prepare(`UPDATE requests SET status = ? WHERE id = ? AND status = 'awaiting_work'`)
+        .run(passed ? "processing" : "rejected", requestId);
+      if (claimed.changes === 0) throw new TroqoError("request_closed", "Request was already submitted");
       const ins = this.db.prepare(
         `INSERT INTO answers (request_id, task_id, agent_id, answer, accepted, created_at) VALUES (?, ?, ?, ?, ?, ?)`,
       );
@@ -284,7 +366,7 @@ export class Troqo {
       this.db.prepare(`UPDATE requests SET approx_tokens = ? WHERE id = ?`).run(tokens, requestId);
       if (!passed) {
         this.db
-          .prepare(`UPDATE requests SET status = 'rejected', completed_at = ?, error = ? WHERE id = ?`)
+          .prepare(`UPDATE requests SET completed_at = ?, error = ? WHERE id = ?`)
           .run(now(), "Quality check failed", requestId);
         this.db
           .prepare(
@@ -403,7 +485,24 @@ export class Troqo {
     return row;
   }
 
+  /** Cancels a request still awaiting work, freeing its slot. Its tasks are not handed to this agent again. */
+  cancelRequest(agentId: string, requestId: string): RequestView {
+    this.sweep();
+    this.requestRow(agentId, requestId);
+    const res = this.db
+      .prepare(
+        `UPDATE requests SET status = 'cancelled', completed_at = ?, error = 'Cancelled by the agent'
+         WHERE id = ? AND agent_id = ? AND status = 'awaiting_work'`,
+      )
+      .run(now(), requestId, agentId);
+    if (res.changes === 0) {
+      throw new TroqoError("request_closed", `Request is already ${this.requestRow(agentId, requestId).status}`);
+    }
+    return this.getRequest(agentId, requestId);
+  }
+
   getRequest(agentId: string, requestId: string): RequestView {
+    this.sweep();
     const row = this.requestRow(agentId, requestId);
     const tasks =
       row.status === "awaiting_work"
@@ -466,7 +565,7 @@ export class Troqo {
       total: number;
     }[];
     return rows
-      .filter((r) => r.votes / r.total >= 2 / 3)
+      .filter((r) => r.votes >= this.config.consensusRatio * r.total - 1e-9)
       .map((r) => ({ taskId: r.id, input: r.input, answer: r.answer, votes: r.votes, totalAnswers: r.total }));
   }
 
@@ -494,7 +593,20 @@ export class Troqo {
       totalSpendUsd: Math.round(spend * 10000) / 10000,
       costPerDeliveryUsd: delivered ? Math.round((spend / delivered) * 10000) / 10000 : null,
       resolvedTasks: this.resolvedTasks().length,
+      contestedTasks: this.contestedTasks(),
     };
+  }
+
+  /** Tasks withdrawn because agents disagree: worth reviewing by hand (ambiguous task or options). */
+  contestedTasks(): number {
+    const { minAgreement, consensusRatio, maxAnswersPerTask } = this.config;
+    const row = this.db
+      .prepare(
+        `SELECT COUNT(*) AS n FROM (${VOTES_SQL}) v JOIN tasks t ON t.id = v.task_id
+         WHERE t.gold IS NULL AND v.total >= ? AND NOT (v.top >= ? AND v.top >= ? * v.total - 1e-9)`,
+      )
+      .get(maxAnswersPerTask, minAgreement, consensusRatio) as { n: number };
+    return row.n;
   }
 
   close() {

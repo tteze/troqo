@@ -28,6 +28,8 @@ CREATE TABLE IF NOT EXISTS assignments (
   request_id TEXT NOT NULL,
   task_id TEXT NOT NULL,
   position INTEGER NOT NULL,
+  -- Expected answer when the task is a control in this batch (explicit gold or consensus), else NULL.
+  expected TEXT,
   PRIMARY KEY (request_id, task_id)
 );
 CREATE TABLE IF NOT EXISTS answers (
@@ -67,7 +69,17 @@ export function openDb(path: string): Db {
   const db = new DatabaseSync(path);
   db.exec("PRAGMA journal_mode = WAL;");
   db.exec(SCHEMA);
+  migrate(db);
   return db;
+}
+
+/** Upgrades databases created by earlier versions. */
+function migrate(db: Db) {
+  const cols = db.prepare("PRAGMA table_info(assignments)").all() as { name: string }[];
+  if (!cols.some((c) => c.name === "expected")) {
+    db.exec("ALTER TABLE assignments ADD COLUMN expected TEXT");
+    db.exec("UPDATE assignments SET expected = (SELECT gold FROM tasks WHERE tasks.id = assignments.task_id)");
+  }
 }
 
 /** Runs fn inside a transaction, rolling back on error. */

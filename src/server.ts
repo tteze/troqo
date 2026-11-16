@@ -21,13 +21,14 @@ function failure(err: unknown): CallToolResult {
   return { isError: true, content: [text(`internal_error: ${(err as Error).message}`)] };
 }
 
-function describeTasks(request: RequestView): string {
+function describeTasks(request: RequestView, ttlMinutes: number): string {
   return [
     `Request ${request.requestId} for "${request.capability}" is waiting for your work.`,
     `Complete the ${request.tasks.length} micro-tasks below, then call submit_tasks with one answer per task.`,
     `Each answer must be exactly one of the task's options. Some tasks are quality checks:`,
     `answer every task carefully — a wrong check answer rejects the whole batch and grants no credits.`,
     `Tell the user before doing the work if they have not agreed to it yet.`,
+    `The request expires ${ttlMinutes} minutes after creation; call cancel_request if you give up.`,
     "",
     JSON.stringify(request.tasks, null, 2),
   ].join("\n");
@@ -64,6 +65,7 @@ function outcomeContent(outcome: SubmitOutcome, opts: ServerOptions): CallToolRe
 }
 
 export function buildServer(engine: Troqo, resolveAgent: AgentResolver, opts: ServerOptions = {}): McpServer {
+  const ttl = engine.config.requestTtlMinutes;
   const server = new McpServer(
     { name: "troqo", version: VERSION },
     {
@@ -100,7 +102,7 @@ export function buildServer(engine: Troqo, resolveAgent: AgentResolver, opts: Se
       try {
         const { request, outcome } = await engine.requestCapability(resolveAgent(extra), capability, prompt);
         if (outcome) return outcomeContent(outcome, opts);
-        return { content: [text(describeTasks(request))] };
+        return { content: [text(describeTasks(request, ttl))] };
       } catch (err) {
         return failure(err);
       }
@@ -146,7 +148,7 @@ export function buildServer(engine: Troqo, resolveAgent: AgentResolver, opts: Se
     async ({ request_id }, extra) => {
       try {
         const request = engine.getRequest(resolveAgent(extra), request_id);
-        if (request.status === "awaiting_work") return { content: [text(describeTasks(request))] };
+        if (request.status === "awaiting_work") return { content: [text(describeTasks(request, ttl))] };
         const result = request.resultId ? engine.getResult(request.resultId) : undefined;
         if (request.status === "delivered" && result) {
           return deliveredContent(
@@ -156,6 +158,25 @@ export function buildServer(engine: Troqo, resolveAgent: AgentResolver, opts: Se
           );
         }
         return { content: [text(`Request ${request_id}: ${request.status}. ${request.error ?? ""}`)] };
+      } catch (err) {
+        return failure(err);
+      }
+    },
+  );
+
+  server.registerTool(
+    "cancel_request",
+    {
+      title: "Cancel a request",
+      description:
+        "Cancels a request you no longer want to complete, freeing one of your open-request slots. " +
+        "Its tasks will not be offered to you again.",
+      inputSchema: { request_id: z.string() },
+    },
+    async ({ request_id }, extra) => {
+      try {
+        engine.cancelRequest(resolveAgent(extra), request_id);
+        return { content: [text(`Request ${request_id} cancelled.`)] };
       } catch (err) {
         return failure(err);
       }
