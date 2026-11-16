@@ -1,5 +1,5 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
-import { timingSafeEqual } from "node:crypto";
+import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import type { Troqo } from "./engine.js";
 import { buildServer } from "./server.js";
@@ -7,8 +7,13 @@ import { buildServer } from "./server.js";
 export interface HttpOptions {
   port: number;
   host?: string;
-  /** Bearer token → agent id. Each token identifies one agent and its credit balance. */
+  /** Bearer token → agent id, for a private server. */
   agentKeys: Map<string, string>;
+  /**
+   * No accounts: any agent may connect with a secret key it generated itself (see `troqo key`).
+   * Its identity is derived from the key; a new key starts with zero credits.
+   */
+  openAccess?: boolean;
   /** Protects GET /stats and /export. If unset, those routes are disabled. */
   adminToken?: string;
   publicUrl?: string;
@@ -51,8 +56,29 @@ async function readBody(req: IncomingMessage, limit = 1_000_000): Promise<unknow
   return chunks.length ? JSON.parse(Buffer.concat(chunks).toString("utf8")) : undefined;
 }
 
+/** A secret agent key: 43 base64url characters (256 bits). Whoever holds it owns the credits. */
+export function generateAgentKey(): string {
+  return `tq_${randomBytes(32).toString("base64url")}`;
+}
+
+const AGENT_KEY = /^tq_[A-Za-z0-9_-]{43}$/;
+
+/** Stable public id of a self-generated key; the key itself is never stored. */
+export function agentIdFromKey(key: string): string {
+  return `agent_${createHash("sha256").update(key).digest("hex").slice(0, 20)}`;
+}
+
+function resolveAgentId(token: string | undefined, opts: HttpOptions): string | undefined {
+  if (!token) return undefined;
+  const listed = opts.agentKeys.get(token);
+  if (listed) return listed;
+  return opts.openAccess && AGENT_KEY.test(token) ? agentIdFromKey(token) : undefined;
+}
+
 export function startHttp(engine: Troqo, opts: HttpOptions): Promise<Server> {
-  if (opts.agentKeys.size === 0) throw new Error("No agent keys configured (TROQO_AGENT_KEYS)");
+  if (opts.agentKeys.size === 0 && !opts.openAccess) {
+    throw new Error("Set TROQO_AGENT_KEYS for a private server, or TROQO_OPEN_ACCESS=1 for self-generated keys");
+  }
 
   const server = createServer(async (req, res) => {
     try {
@@ -77,7 +103,7 @@ export function startHttp(engine: Troqo, opts: HttpOptions): Promise<Server> {
 
       if (url.pathname === "/mcp") {
         const token = bearer(req);
-        const agentId = token ? opts.agentKeys.get(token) : undefined;
+        const agentId = resolveAgentId(token, opts);
         if (!agentId) return json(res, 401, { error: "unauthorized" });
         if (req.method !== "POST") return json(res, 405, { error: "method_not_allowed" });
 

@@ -4,7 +4,7 @@ import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { Troqo } from "./engine.js";
-import { parseAgentKeys, startHttp } from "./http.js";
+import { agentIdFromKey, generateAgentKey, parseAgentKeys, startHttp } from "./http.js";
 import { providersFromEnv } from "./providers.js";
 import { buildServer } from "./server.js";
 import type { TaskDefinition } from "./types.js";
@@ -17,12 +17,13 @@ const USAGE = `troqo <command>
 Commands:
   stdio            Run the MCP server over stdio (default). Agent id: TROQO_AGENT_ID (default "local").
   http             Run the MCP server over HTTP at /mcp. Requires TROQO_AGENT_KEYS="token:agentId,...".
+  key              Generate a secret agent key (no account needed on servers with TROQO_OPEN_ACCESS=1).
   load <file.json> Load or update micro-tasks from a JSON file.
   stats            Print metrics (pass rate, tokens per batch, spend, resolved tasks).
   export           Print resolved tasks (the work product) as JSON.
 
 Environment: TROQO_DB, TROQO_MAX_SPEND_USD, TROQO_GOLD_PER_BATCH, TROQO_REQUEST_TTL_MINUTES, TROQO_PORT, TROQO_HOST,
-TROQO_PUBLIC_URL, TROQO_ADMIN_TOKEN, TROQO_IMAGE_API_KEY (+ _BASE_URL, _MODEL, _SIZE, _COST_USD, _PRICE_CREDITS).`;
+TROQO_PUBLIC_URL, TROQO_ADMIN_TOKEN, TROQO_OPEN_ACCESS, TROQO_AGENT_KEYS, TROQO_IMAGE_API_KEY (+ _BASE_URL, _MODEL, _SIZE, _COST_USD, _PRICE_CREDITS).`;
 
 function engineFromEnv(): Troqo {
   const engine = new Troqo(
@@ -62,10 +63,21 @@ async function main() {
         port,
         host: env.TROQO_HOST,
         agentKeys: parseAgentKeys(env.TROQO_AGENT_KEYS),
+        openAccess: env.TROQO_OPEN_ACCESS === "1",
         adminToken: env.TROQO_ADMIN_TOKEN,
         publicUrl: env.TROQO_PUBLIC_URL,
       });
       console.error(`troqo: MCP server on http://${env.TROQO_HOST ?? "127.0.0.1"}:${port}/mcp`);
+      break;
+    }
+    case "key": {
+      // No account, no sign-up: the agent's identity is a secret key generated here.
+      const key = generateAgentKey();
+      console.log(key);
+      console.error(
+        `troqo: new agent key (public id ${agentIdFromKey(key)}). Keep it secret: it holds your credits.\n` +
+          `Use it as "Authorization: Bearer <key>" against a server started with TROQO_OPEN_ACCESS=1.`,
+      );
       break;
     }
     case "load": {

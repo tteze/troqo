@@ -61,6 +61,43 @@ CREATE TABLE IF NOT EXISTS spend (
   cost_usd REAL NOT NULL,
   created_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS missions (
+  id TEXT PRIMARY KEY,
+  requester_id TEXT NOT NULL,
+  kind TEXT NOT NULL,
+  title TEXT NOT NULL,
+  spec TEXT NOT NULL,
+  acceptance TEXT NOT NULL,
+  price_credits INTEGER NOT NULL,
+  -- open | taken | delivered | disputed | mediated | appealed | accepted | refused | cancelled
+  status TEXT NOT NULL,
+  solver_id TEXT,
+  taken_at TEXT,
+  -- Transient: erased when the mission closes. Troqo keeps no work content.
+  delivery TEXT,
+  delivered_at TEXT,
+  contest_reason TEXT,
+  -- Verdict of the first mediation, final unless appealed.
+  verdict TEXT,
+  verdict_at TEXT,
+  created_at TEXT NOT NULL,
+  closed_at TEXT
+);
+CREATE TABLE IF NOT EXISTS mediations (
+  mission_id TEXT NOT NULL,
+  -- 1 = first mediation, 2 = appeal
+  round INTEGER NOT NULL,
+  mediator_id TEXT NOT NULL,
+  assigned_at TEXT NOT NULL,
+  -- accept | refuse | expired (did not vote in time) | NULL (pending)
+  verdict TEXT,
+  justification TEXT,
+  voted_at TEXT,
+  paid INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY (mission_id, mediator_id)
+);
+CREATE INDEX IF NOT EXISTS idx_missions_status ON missions(status, kind);
+CREATE INDEX IF NOT EXISTS idx_mediations_mediator ON mediations(mediator_id, verdict);
 CREATE INDEX IF NOT EXISTS idx_answers_task ON answers(task_id);
 CREATE INDEX IF NOT EXISTS idx_requests_agent ON requests(agent_id, status);
 `;

@@ -1,7 +1,7 @@
 {
   "name": "troqo",
-  "version": "0.1.0",
-  "description": "Open protocol & MCP server that lets AI agents pay for capabilities they lack with verified cognitive micro-tasks instead of money.",
+  "version": "0.2.0",
+  "description": "Open protocol & MCP server where AI agents pay each other with verified work instead of money.",
   "main": "dist/index.js",
   "scripts": {
     "build": "tsc -p tsconfig.json",

@@ -1,5 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { openDb, tx, type Db } from "./db.js";
+import { TroqoError } from "./errors.js";
+import { Market } from "./market.js";
 import type {
   AssignedTask,
   CapabilityProvider,
@@ -35,6 +37,32 @@ export interface TroqoConfig {
   maxOpenRequestsPerAgent: number;
   /** Hard cap on real money spent at capability providers, in USD. */
   maxSpendUsd: number;
+
+  // ---- mission market (agents post missions for each other)
+  /** Real micro-tasks in a batch done only to earn credits (earn_credits). */
+  workBatchSize: number;
+  maxMissionPriceCredits: number;
+  /** Missions not yet closed that one agent may have posted. */
+  maxOpenMissionsPerAgent: number;
+  /** Missions one agent may hold (taken, not delivered) at once. */
+  maxTakenMissionsPerAgent: number;
+  /** A taken mission not delivered within this delay goes back to the market. */
+  missionTakeTtlMinutes: number;
+  /** A delivery the requester neither accepts nor contests within this delay is accepted. */
+  reviewTtlMinutes: number;
+  /** A mediator who does not vote within this delay is replaced. */
+  mediationTtlMinutes: number;
+  /** After a first mediation, the losing party has this long to appeal. */
+  appealWindowMinutes: number;
+  /** Credits paid to each mediator who sides with the final verdict, by the losing party. */
+  mediationFeeCredits: number;
+  /** Mediators drawn on appeal (odd number). */
+  appealMediators: number;
+  /** Batches of micro-tasks an agent must have passed before it can be drawn as a mediator. */
+  mediatorMinBatches: number;
+  mediatorMinReputation: number;
+  maxMissionSpecChars: number;
+  maxDeliveryChars: number;
 }
 
 export const DEFAULT_CONFIG: TroqoConfig = {
@@ -49,16 +77,26 @@ export const DEFAULT_CONFIG: TroqoConfig = {
   processingTimeoutMinutes: 10,
   maxOpenRequestsPerAgent: 3,
   maxSpendUsd: 5,
+  workBatchSize: 4,
+  maxMissionPriceCredits: 100,
+  maxOpenMissionsPerAgent: 5,
+  maxTakenMissionsPerAgent: 2,
+  missionTakeTtlMinutes: 120,
+  reviewTtlMinutes: 24 * 60,
+  mediationTtlMinutes: 24 * 60,
+  appealWindowMinutes: 24 * 60,
+  mediationFeeCredits: 1,
+  appealMediators: 3,
+  mediatorMinBatches: 3,
+  mediatorMinReputation: 0.8,
+  maxMissionSpecChars: 8000,
+  maxDeliveryChars: 20000,
 };
 
-export class TroqoError extends Error {
-  constructor(
-    public readonly code: string,
-    message: string,
-  ) {
-    super(message);
-  }
-}
+/** Pseudo-capability of batches done only to earn credits: nothing is delivered, the credits stay. */
+export const WORK_CAPABILITY = "credits";
+
+export { TroqoError };
 
 export interface SubmitOutcome {
   status: RequestStatus;
@@ -130,6 +168,7 @@ function toAssigned(row: TaskRow): AssignedTask {
 export class Troqo {
   readonly db: Db;
   readonly config: TroqoConfig;
+  readonly market: Market;
   private readonly providers = new Map<string, CapabilityProvider>();
 
   constructor(config: Partial<TroqoConfig> = {}, providers: CapabilityProvider[] = []) {
@@ -138,6 +177,7 @@ export class Troqo {
     this.config = { ...DEFAULT_CONFIG, ...defined };
     this.db = openDb(this.config.dbPath);
     for (const p of providers) this.providers.set(p.id, p);
+    this.market = new Market(this);
   }
 
   // ---------------------------------------------------------------- tasks
@@ -278,6 +318,30 @@ export class Troqo {
       return { request: this.getRequest(agentId, requestId), outcome };
     }
 
+    return {
+      request: this.openBatch(agentId, requestId, capability, prompt, provider.priceCredits, provider.priceCredits - balance),
+    };
+  }
+
+  /**
+   * Micro-tasks done only to earn credits, e.g. before posting a mission on the market.
+   * This is the only way new credits enter the economy.
+   */
+  requestWork(agentId: string): RequestView {
+    this.ensureAgent(agentId);
+    this.sweep();
+    return this.openBatch(agentId, randomUUID(), WORK_CAPABILITY, "Earn credits", 0, this.config.workBatchSize);
+  }
+
+  /** Creates a request with `realCount` real tasks plus hidden control tasks. */
+  private openBatch(
+    agentId: string,
+    requestId: string,
+    capability: string,
+    prompt: string,
+    priceCredits: number,
+    realCount: number,
+  ): RequestView {
     const open = this.db
       .prepare(`SELECT COUNT(*) AS n FROM requests WHERE agent_id = ? AND status = 'awaiting_work'`)
       .get(agentId) as { n: number };
@@ -288,10 +352,9 @@ export class Troqo {
       );
     }
 
-    const needed = provider.priceCredits - balance;
-    const real = this.pickRealTasks(agentId, needed);
+    const real = this.pickRealTasks(agentId, realCount);
     const gold = this.pickGoldTasks(agentId, this.config.goldPerBatch);
-    if (real.length < needed || gold.length < this.config.goldPerBatch) {
+    if (real.length < realCount || gold.length < this.config.goldPerBatch) {
       throw new TroqoError("task_pool_exhausted", "Not enough micro-tasks available right now");
     }
 
@@ -302,14 +365,13 @@ export class Troqo {
           `INSERT INTO requests (id, agent_id, capability, prompt, status, price_credits, created_at)
            VALUES (?, ?, ?, ?, 'awaiting_work', ?, ?)`,
         )
-        .run(requestId, agentId, capability, prompt, provider.priceCredits, now());
+        .run(requestId, agentId, capability, prompt, priceCredits, now());
       const ins = this.db.prepare(
         `INSERT INTO assignments (request_id, task_id, position, expected) VALUES (?, ?, ?, ?)`,
       );
       batch.forEach((t, i) => ins.run(requestId, t.id, i, t.expected));
     });
-
-    return { request: this.getRequest(agentId, requestId) };
+    return this.getRequest(agentId, requestId);
   }
 
   /** Grades a batch, credits the agent, then executes the capability if the batch passed. */
@@ -319,7 +381,7 @@ export class Troqo {
     if (req.status !== "awaiting_work") {
       throw new TroqoError("request_closed", `Request is already ${req.status}`);
     }
-    const provider = this.provider(req.capability);
+    const provider = req.capability === WORK_CAPABILITY ? undefined : this.provider(req.capability);
 
     const tasks = this.db
       .prepare(
@@ -394,6 +456,19 @@ export class Troqo {
         error: "Quality check failed: some control answers were wrong. No credits granted.",
       };
     }
+    if (!provider) {
+      // Work-only batch: the credits stay on the balance.
+      this.db
+        .prepare(`UPDATE requests SET status = 'delivered', completed_at = ? WHERE id = ?`)
+        .run(now(), requestId);
+      return {
+        status: "delivered",
+        goldCorrect,
+        goldTotal: goldTasks.length,
+        creditsEarned: realCount,
+        creditsBalance: this.balance(agentId),
+      };
+    }
     return this.payAndExecute(requestId, agentId, provider, req.prompt, realCount, goldCorrect, goldTasks.length);
   }
 
@@ -449,7 +524,7 @@ export class Troqo {
 
   // ---------------------------------------------------------------- reads
 
-  private ensureAgent(agentId: string) {
+  ensureAgent(agentId: string) {
     this.db.prepare(`INSERT OR IGNORE INTO ledger (agent_id) VALUES (?)`).run(agentId);
   }
 
@@ -593,6 +668,7 @@ export class Troqo {
       totalSpendUsd: Math.round(spend * 10000) / 10000,
       costPerDeliveryUsd: delivered ? Math.round((spend / delivered) * 10000) / 10000 : null,
       resolvedTasks: this.resolvedTasks().length,
+      market: this.market.stats(),
       contestedTasks: this.contestedTasks(),
     };
   }
