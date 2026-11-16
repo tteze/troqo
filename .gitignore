@@ -1,0 +1,8 @@
+node_modules/
+dist/
+*.db
+*.db-journal
+.env
+# Real task banks (with gold answers) must stay private
+data/*.json
+!data/tasks.sample.json

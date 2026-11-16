@@ -1,0 +1,514 @@
+[
+  {
+    "id": "cat-001",
+    "kind": "classify",
+    "instruction": "Classify this e-commerce product title into its category.",
+    "options": [
+      "Clothing",
+      "Electronics",
+      "Home & Kitchen",
+      "Beauty",
+      "Sports & Outdoors",
+      "Toys"
+    ],
+    "input": "Men's slim-fit cotton oxford shirt, long sleeve",
+    "gold": "Clothing"
+  },
+  {
+    "id": "cat-002",
+    "kind": "classify",
+    "instruction": "Classify this e-commerce product title into its category.",
+    "options": [
+      "Clothing",
+      "Electronics",
+      "Home & Kitchen",
+      "Beauty",
+      "Sports & Outdoors",
+      "Toys"
+    ],
+    "input": "Wireless noise-cancelling over-ear headphones, 30h battery",
+    "gold": "Electronics"
+  },
+  {
+    "id": "cat-003",
+    "kind": "classify",
+    "instruction": "Classify this e-commerce product title into its category.",
+    "options": [
+      "Clothing",
+      "Electronics",
+      "Home & Kitchen",
+      "Beauty",
+      "Sports & Outdoors",
+      "Toys"
+    ],
+    "input": "Non-stick ceramic frying pan 28 cm, induction compatible",
+    "gold": "Home & Kitchen"
+  },
+  {
+    "id": "cat-004",
+    "kind": "classify",
+    "instruction": "Classify this e-commerce product title into its category.",
+    "options": [
+      "Clothing",
+      "Electronics",
+      "Home & Kitchen",
+      "Beauty",
+      "Sports & Outdoors",
+      "Toys"
+    ],
+    "input": "Hydrating hyaluronic acid face serum 30 ml",
+    "gold": "Beauty"
+  },
+  {
+    "id": "cat-005",
+    "kind": "classify",
+    "instruction": "Classify this e-commerce product title into its category.",
+    "options": [
+      "Clothing",
+      "Electronics",
+      "Home & Kitchen",
+      "Beauty",
+      "Sports & Outdoors",
+      "Toys"
+    ],
+    "input": "Lightweight 2-person camping tent, waterproof",
+    "gold": "Sports & Outdoors"
+  },
+  {
+    "id": "cat-006",
+    "kind": "classify",
+    "instruction": "Classify this e-commerce product title into its category.",
+    "options": [
+      "Clothing",
+      "Electronics",
+      "Home & Kitchen",
+      "Beauty",
+      "Sports & Outdoors",
+      "Toys"
+    ],
+    "input": "Wooden stacking blocks set for toddlers, 50 pieces",
+    "gold": "Toys"
+  },
+  {
+    "id": "cat-007",
+    "kind": "classify",
+    "instruction": "Classify this e-commerce product title into its category.",
+    "options": [
+      "Clothing",
+      "Electronics",
+      "Home & Kitchen",
+      "Beauty",
+      "Sports & Outdoors",
+      "Toys"
+    ],
+    "input": "USB-C fast charger 65W GaN, 3 ports"
+  },
+  {
+    "id": "cat-008",
+    "kind": "classify",
+    "instruction": "Classify this e-commerce product title into its category.",
+    "options": [
+      "Clothing",
+      "Electronics",
+      "Home & Kitchen",
+      "Beauty",
+      "Sports & Outdoors",
+      "Toys"
+    ],
+    "input": "Women's merino wool crew-neck sweater"
+  },
+  {
+    "id": "cat-009",
+    "kind": "classify",
+    "instruction": "Classify this e-commerce product title into its category.",
+    "options": [
+      "Clothing",
+      "Electronics",
+      "Home & Kitchen",
+      "Beauty",
+      "Sports & Outdoors",
+      "Toys"
+    ],
+    "input": "Stainless steel French press coffee maker 1 L"
+  },
+  {
+    "id": "cat-010",
+    "kind": "classify",
+    "instruction": "Classify this e-commerce product title into its category.",
+    "options": [
+      "Clothing",
+      "Electronics",
+      "Home & Kitchen",
+      "Beauty",
+      "Sports & Outdoors",
+      "Toys"
+    ],
+    "input": "Matte liquid lipstick, long-lasting, shade rosewood"
+  },
+  {
+    "id": "cat-011",
+    "kind": "classify",
+    "instruction": "Classify this e-commerce product title into its category.",
+    "options": [
+      "Clothing",
+      "Electronics",
+      "Home & Kitchen",
+      "Beauty",
+      "Sports & Outdoors",
+      "Toys"
+    ],
+    "input": "Adjustable dumbbells pair, 2–24 kg"
+  },
+  {
+    "id": "cat-012",
+    "kind": "classify",
+    "instruction": "Classify this e-commerce product title into its category.",
+    "options": [
+      "Clothing",
+      "Electronics",
+      "Home & Kitchen",
+      "Beauty",
+      "Sports & Outdoors",
+      "Toys"
+    ],
+    "input": "Remote control off-road RC car for kids 8+"
+  },
+  {
+    "id": "cat-013",
+    "kind": "classify",
+    "instruction": "Classify this e-commerce product title into its category.",
+    "options": [
+      "Clothing",
+      "Electronics",
+      "Home & Kitchen",
+      "Beauty",
+      "Sports & Outdoors",
+      "Toys"
+    ],
+    "input": "27-inch 4K IPS monitor with HDR10"
+  },
+  {
+    "id": "cat-014",
+    "kind": "classify",
+    "instruction": "Classify this e-commerce product title into its category.",
+    "options": [
+      "Clothing",
+      "Electronics",
+      "Home & Kitchen",
+      "Beauty",
+      "Sports & Outdoors",
+      "Toys"
+    ],
+    "input": "Bamboo cutting board set of 3"
+  },
+  {
+    "id": "cat-015",
+    "kind": "classify",
+    "instruction": "Classify this e-commerce product title into its category.",
+    "options": [
+      "Clothing",
+      "Electronics",
+      "Home & Kitchen",
+      "Beauty",
+      "Sports & Outdoors",
+      "Toys"
+    ],
+    "input": "Trail running shoes, men's, Gore-Tex"
+  },
+  {
+    "id": "cat-016",
+    "kind": "classify",
+    "instruction": "Classify this e-commerce product title into its category.",
+    "options": [
+      "Clothing",
+      "Electronics",
+      "Home & Kitchen",
+      "Beauty",
+      "Sports & Outdoors",
+      "Toys"
+    ],
+    "input": "Kids' magnetic drawing board"
+  },
+  {
+    "id": "cat-017",
+    "kind": "classify",
+    "instruction": "Classify this e-commerce product title into its category.",
+    "options": [
+      "Clothing",
+      "Electronics",
+      "Home & Kitchen",
+      "Beauty",
+      "Sports & Outdoors",
+      "Toys"
+    ],
+    "input": "Vitamin C brightening night cream"
+  },
+  {
+    "id": "cat-018",
+    "kind": "classify",
+    "instruction": "Classify this e-commerce product title into its category.",
+    "options": [
+      "Clothing",
+      "Electronics",
+      "Home & Kitchen",
+      "Beauty",
+      "Sports & Outdoors",
+      "Toys"
+    ],
+    "input": "Smartwatch with GPS and heart-rate monitor"
+  },
+  {
+    "id": "cat-019",
+    "kind": "classify",
+    "instruction": "Classify this e-commerce product title into its category.",
+    "options": [
+      "Clothing",
+      "Electronics",
+      "Home & Kitchen",
+      "Beauty",
+      "Sports & Outdoors",
+      "Toys"
+    ],
+    "input": "Linen duvet cover set, queen size"
+  },
+  {
+    "id": "cat-020",
+    "kind": "classify",
+    "instruction": "Classify this e-commerce product title into its category.",
+    "options": [
+      "Clothing",
+      "Electronics",
+      "Home & Kitchen",
+      "Beauty",
+      "Sports & Outdoors",
+      "Toys"
+    ],
+    "input": "Waterproof hiking backpack 40 L"
+  },
+  {
+    "id": "cat-021",
+    "kind": "classify",
+    "instruction": "Classify this e-commerce product title into its category.",
+    "options": [
+      "Clothing",
+      "Electronics",
+      "Home & Kitchen",
+      "Beauty",
+      "Sports & Outdoors",
+      "Toys"
+    ],
+    "input": "Plush unicorn stuffed animal 30 cm"
+  },
+  {
+    "id": "cat-022",
+    "kind": "classify",
+    "instruction": "Classify this e-commerce product title into its category.",
+    "options": [
+      "Clothing",
+      "Electronics",
+      "Home & Kitchen",
+      "Beauty",
+      "Sports & Outdoors",
+      "Toys"
+    ],
+    "input": "Denim jacket, oversized, unisex"
+  },
+  {
+    "id": "cat-023",
+    "kind": "classify",
+    "instruction": "Classify this e-commerce product title into its category.",
+    "options": [
+      "Clothing",
+      "Electronics",
+      "Home & Kitchen",
+      "Beauty",
+      "Sports & Outdoors",
+      "Toys"
+    ],
+    "input": "Robot vacuum cleaner with mapping"
+  },
+  {
+    "id": "cat-024",
+    "kind": "classify",
+    "instruction": "Classify this e-commerce product title into its category.",
+    "options": [
+      "Clothing",
+      "Electronics",
+      "Home & Kitchen",
+      "Beauty",
+      "Sports & Outdoors",
+      "Toys"
+    ],
+    "input": "Electric gooseneck kettle with temperature control"
+  },
+  {
+    "id": "sent-001",
+    "kind": "classify",
+    "instruction": "What is the sentiment of this customer review?",
+    "options": [
+      "positive",
+      "negative",
+      "neutral"
+    ],
+    "input": "Arrived quickly and works perfectly. Would buy again.",
+    "gold": "positive"
+  },
+  {
+    "id": "sent-002",
+    "kind": "classify",
+    "instruction": "What is the sentiment of this customer review?",
+    "options": [
+      "positive",
+      "negative",
+      "neutral"
+    ],
+    "input": "Broke after two days, total waste of money.",
+    "gold": "negative"
+  },
+  {
+    "id": "sent-003",
+    "kind": "classify",
+    "instruction": "What is the sentiment of this customer review?",
+    "options": [
+      "positive",
+      "negative",
+      "neutral"
+    ],
+    "input": "It does what it says. Nothing special.",
+    "gold": "neutral"
+  },
+  {
+    "id": "sent-004",
+    "kind": "classify",
+    "instruction": "What is the sentiment of this customer review?",
+    "options": [
+      "positive",
+      "negative",
+      "neutral"
+    ],
+    "input": "The colour is lovely and the fabric feels premium.",
+    "gold": "positive"
+  },
+  {
+    "id": "sent-005",
+    "kind": "classify",
+    "instruction": "What is the sentiment of this customer review?",
+    "options": [
+      "positive",
+      "negative",
+      "neutral"
+    ],
+    "input": "Customer service never answered my emails.",
+    "gold": "negative"
+  },
+  {
+    "id": "sent-006",
+    "kind": "classify",
+    "instruction": "What is the sentiment of this customer review?",
+    "options": [
+      "positive",
+      "negative",
+      "neutral"
+    ],
+    "input": "Fits as expected."
+  },
+  {
+    "id": "sent-007",
+    "kind": "classify",
+    "instruction": "What is the sentiment of this customer review?",
+    "options": [
+      "positive",
+      "negative",
+      "neutral"
+    ],
+    "input": "Battery barely lasts an afternoon, very disappointed."
+  },
+  {
+    "id": "sent-008",
+    "kind": "classify",
+    "instruction": "What is the sentiment of this customer review?",
+    "options": [
+      "positive",
+      "negative",
+      "neutral"
+    ],
+    "input": "Absolutely love it, my daughter plays with it every day!"
+  },
+  {
+    "id": "sent-009",
+    "kind": "classify",
+    "instruction": "What is the sentiment of this customer review?",
+    "options": [
+      "positive",
+      "negative",
+      "neutral"
+    ],
+    "input": "Packaging was damaged but the product is fine."
+  },
+  {
+    "id": "sent-010",
+    "kind": "classify",
+    "instruction": "What is the sentiment of this customer review?",
+    "options": [
+      "positive",
+      "negative",
+      "neutral"
+    ],
+    "input": "Too small and the return process is a nightmare."
+  },
+  {
+    "id": "sent-011",
+    "kind": "classify",
+    "instruction": "What is the sentiment of this customer review?",
+    "options": [
+      "positive",
+      "negative",
+      "neutral"
+    ],
+    "input": "Great value for the price."
+  },
+  {
+    "id": "sent-012",
+    "kind": "classify",
+    "instruction": "What is the sentiment of this customer review?",
+    "options": [
+      "positive",
+      "negative",
+      "neutral"
+    ],
+    "input": "Average quality, delivered on time."
+  },
+  {
+    "id": "sent-013",
+    "kind": "classify",
+    "instruction": "What is the sentiment of this customer review?",
+    "options": [
+      "positive",
+      "negative",
+      "neutral"
+    ],
+    "input": "Stopped working after a week, avoid."
+  },
+  {
+    "id": "sent-014",
+    "kind": "classify",
+    "instruction": "What is the sentiment of this customer review?",
+    "options": [
+      "positive",
+      "negative",
+      "neutral"
+    ],
+    "input": "Exceeded my expectations in every way."
+  },
+  {
+    "id": "sent-015",
+    "kind": "classify",
+    "instruction": "What is the sentiment of this customer review?",
+    "options": [
+      "positive",
+      "negative",
+      "neutral"
+    ],
+    "input": "The instructions were unclear but it works."
+  }
+]
