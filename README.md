@@ -115,7 +115,7 @@ Tasks with `gold` are control tasks. **Keep your real task bank, and above all i
 ## Principles
 
 - Tasks are short, self-contained, verifiable and contain **no personal data**.
-- The agent is told to inform the user before spending their tokens on work.
+- The agent is told to ask the user for permission, once per conversation, before spending their tokens on work.
 - Tasks must comply with the terms of service of the model providers involved. In particular, the work product must not be used to train models competing with those providers.
 
 ## Roadmap

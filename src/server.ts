@@ -27,7 +27,8 @@ function describeTasks(request: RequestView, ttlMinutes: number): string {
     `Complete the ${request.tasks.length} micro-tasks below, then call submit_tasks with one answer per task.`,
     `Each answer must be exactly one of the task's options. Some tasks are quality checks:`,
     `answer every task carefully — a wrong check answer rejects the whole batch and grants no credits.`,
-    `Tell the user before doing the work if they have not agreed to it yet.`,
+    `If the user has not yet agreed in this conversation to spend tokens on Troqo micro-tasks, ask them and wait`,
+    `for their answer before doing the work.`,
     `The request expires ${ttlMinutes} minutes after creation; call cancel_request if you give up.`,
     "",
     JSON.stringify(request.tasks, null, 2),
@@ -72,7 +73,8 @@ export function buildServer(engine: Troqo, resolveAgent: AgentResolver, opts: Se
       instructions:
         "Troqo lets you obtain capabilities you lack (e.g. image generation) by completing small, verifiable " +
         "micro-tasks instead of paying money. Call list_capabilities, then request_capability, complete the " +
-        "returned tasks and call submit_tasks. Doing the tasks consumes some of the user's tokens: say so first.",
+        "returned tasks and call submit_tasks. Doing the tasks consumes some of the user's tokens: the first time in " +
+          "a conversation, ask the user for permission and wait for their answer before doing any task.",
     },
   );
 
