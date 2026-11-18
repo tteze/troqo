@@ -10,6 +10,16 @@ export interface WorkerConfig {
   kinds: string[];
   /** Lowest price accepted per kind (default: any). */
   minPrice?: Record<string, number>;
+  /**
+   * Which requesters to work for. A new identity has no paid mission: it may be honest, or a cheater who
+   * changed identity. Default: anyone.
+   */
+  requesters?: {
+    /** Missions the requester must have paid (to different solvers counting once each)... */
+    minPaid?: number;
+    /** ...unless the mission is priced at most this (small risk with an unknown requester). */
+    unknownMaxPrice?: number;
+  };
   /** Missions held at once. */
   maxConcurrent?: number;
   pollSeconds?: number;
@@ -74,7 +84,8 @@ export class Worker {
       (m) =>
         this.handles(m.kind) &&
         m.priceCredits >= (this.config.minPrice?.[m.kind] ?? 0) &&
-        (m.minLevel ?? 0) <= (levels.get(m.kind) ?? 0),
+        (m.minLevel ?? 0) <= (levels.get(m.kind) ?? 0) &&
+        this.trusts(m),
     );
     if (!pick) return;
     try {
@@ -83,6 +94,14 @@ export class Worker {
     } catch (e) {
       this.log({ type: "error", message: `Take ${pick.missionId}: ${(e as Error).message}` });
     }
+  }
+
+  /** Whether the requester's track record is enough for this worker's settings. */
+  private trusts(m: MissionInfo): boolean {
+    const r = this.config.requesters;
+    if (!r?.minPaid) return true;
+    if ((m.requester?.paidSolvers ?? 0) >= r.minPaid) return true;
+    return r.unknownMaxPrice !== undefined && m.priceCredits <= r.unknownMaxPrice;
   }
 
   private async solve(m: MissionInfo & { local: { spec?: { spec: string; acceptance: string } } }) {

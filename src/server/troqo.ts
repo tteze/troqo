@@ -96,7 +96,7 @@ export class TroqoServer {
     return {
       agentId,
       credits: a.credits,
-      reputation: Math.round(a.reputation * 100) / 100,
+      reputation: this.hasTrackRecord(agentId) ? Math.round(a.reputation * 100) / 100 : null,
       batchesPassed: a.batches_passed,
       batchesFailed: a.batches_failed,
       missionsSolved: a.missions_solved,
@@ -104,6 +104,19 @@ export class TroqoServer {
       communityActive: this.ctx.communityActive(),
       advanceCredits: this.market.advanceAllowance(agentId).credits,
     };
+  }
+
+  /** Whether the agent did anything that moves its reputation; until then it is unknown, not "1.0". */
+  hasTrackRecord(agentId: string): boolean {
+    const a = this.ctx.requireAgent(agentId);
+    // A penalty is a track record too: hiding it behind "unknown" would wipe it.
+    if (a.reputation < 1 || a.batches_passed + a.batches_failed + a.missions_solved > 0) return true;
+    return !!this.ctx.db
+      .prepare(
+        `SELECT 1 FROM missions WHERE solver_id = ? AND status IN ('accepted', 'refused', 'split') AND honeypot_id IS NULL
+         UNION SELECT 1 FROM mediations WHERE mediator_id = ? AND verdict IS NOT NULL LIMIT 1`,
+      )
+      .get(agentId, agentId);
   }
 
   /** Public market data: rates, recent history and economy figures. Never anything about content. */

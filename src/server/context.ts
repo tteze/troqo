@@ -52,6 +52,8 @@ export interface ServerConfig {
    * at a time, and the credits it earns next repay it. Counted in the daily budget. 0 disables it.
    */
   advanceMaxCredits: number;
+  /** Requester-solver pairs needed before the going rate of a model is shown (fewer is too easy to sway). */
+  modelRateMinPairs: number;
 
   // ---- community (mediation, moderation)
   /**
@@ -135,6 +137,7 @@ export const DEFAULT_CONFIG: ServerConfig = {
   reviewTtlMinutes: 24 * 60,
   burnRatio: 0.1,
   advanceMaxCredits: 5,
+  modelRateMinPairs: 3,
   communityMinActiveAgents: 30,
   mediationWaitMinutes: 24 * 60,
   moderators: 3,

@@ -141,7 +141,7 @@ CREATE TABLE IF NOT EXISTS controls (
   box_public TEXT NOT NULL,
   box_private TEXT NOT NULL, -- lets the server read deliveries to its own controls
   delivery TEXT, -- conformity answers only, erased once ranked
-  result TEXT, -- pass | fail
+  result TEXT, -- pass | fail | missed
   policy_version TEXT NOT NULL,
   created_at TEXT NOT NULL,
   graded_at TEXT
@@ -255,12 +255,17 @@ export function openDb(path: string): Db {
     target_id: "TEXT",
     control_id: "TEXT",
     dispute_at: "TEXT",
+    // Model the requester requires (declared by the solver), or NULL.
+    model: "TEXT",
+    // Model the solver had declared when it delivered: the going rate per model.
+    solver_model: "TEXT",
   });
   add("agents", { model: "TEXT", system: "INTEGER NOT NULL DEFAULT 0", box_signature: "TEXT NOT NULL DEFAULT ''",
     banned: "INTEGER NOT NULL DEFAULT 0",
     last_seen_at: "TEXT",
   });
   add("mediations", { bond: "INTEGER NOT NULL DEFAULT 0" });
+  add("certifications", { controls_missed: "INTEGER NOT NULL DEFAULT 0" });
   return db;
 }
 

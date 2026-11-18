@@ -88,6 +88,8 @@ td.num, th.num { text-align: right; font-family: var(--mono); font-variant-numer
 .stat span { color: var(--muted); font-size: 14px; }
 .chart svg { width: 100%; height: auto; display: block; }
 .empty { color: var(--muted); padding: 18px; }
+tr.sub td { color: var(--muted); font-size: 14px; }
+.model { font-family: var(--mono); font-size: 13px; }
 .note { font-size: 14px; color: var(--muted); }
 
 .doc { display: grid; gap: 16px; max-width: 820px; }

@@ -10,6 +10,7 @@ import { TroqoError } from "../shared/errors.js";
 import {
   canonicalDelivery,
   canonicalSpec,
+  type AgentEvents,
   type Inbox,
   type InboxMessage,
   type InboxTask,
@@ -18,6 +19,7 @@ import {
   type MissionInfo,
   type MissionStatus,
   type PendingMediation,
+  type RequesterRecord,
   type Verdict,
 } from "../shared/protocol.js";
 
@@ -29,6 +31,8 @@ import {
 
 const KIND = /^[a-z][a-z0-9-]{1,30}$/;
 const HASH = /^[0-9a-f]{64}$/;
+/** Same format as a declared model (Certifier.setModel). */
+const MODEL = /^[a-z0-9][a-z0-9._-]{1,59}$/;
 const ACTIVE: MissionStatus[] = ["open", "taken", "in_progress", "delivered", "disputed", "mediated", "appealed"];
 const IN_DISPUTE: MissionStatus[] = ["disputed", "appealed"];
 
@@ -53,6 +57,8 @@ interface MissionRow {
   outcome_reason: string | null;
   honeypot_id: string | null;
   min_level: number;
+  model: string | null;
+  solver_model: string | null;
   target_id: string | null;
   control_id: string | null;
   solver_bond: number;
@@ -96,6 +102,8 @@ export interface PostMissionInput {
   specHash: string;
   /** Certification level in this kind a solver needs to take the mission. */
   minLevel?: number;
+  /** Model the solver must have declared. */
+  model?: string;
 }
 
 export class Market {
@@ -141,6 +149,8 @@ export class Market {
       check(cert && cert.policy.kinds.includes(kind), "invalid_mission", `minLevel: only for certifiable kinds (${cert?.policy.kinds.join(", ")})`);
       check(Number.isInteger(minLevel) && minLevel <= cert.maxLevel(), "invalid_mission", `minLevel: 0 to ${cert.maxLevel()}`);
     }
+    const model = input.model?.trim().toLowerCase() || null;
+    check(model === null || MODEL.test(model), "invalid_mission", "model: a declared model slug, e.g. claude-opus-5-5 (see get_market)");
     const open = this.db
       .prepare(`SELECT COUNT(*) AS n FROM missions WHERE requester_id = ? AND status IN (${ACTIVE.map(() => "?").join(",")})`)
       .get(agentId, ...ACTIVE) as { n: number };
@@ -162,10 +172,10 @@ export class Market {
       this.c.supply("advance", advance);
       this.db
         .prepare(
-          `INSERT INTO missions (id, requester_id, kind, title, summary, price_credits, spec_hash, status, min_level, created_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, 'open', ?, ?)`,
+          `INSERT INTO missions (id, requester_id, kind, title, summary, price_credits, spec_hash, status, min_level, model, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, 'open', ?, ?, ?)`,
         )
-        .run(id, agentId, kind, input.title.trim(), input.summary.trim(), price, input.specHash, minLevel, now());
+        .run(id, agentId, kind, input.title.trim(), input.summary.trim(), price, input.specHash, minLevel, model, now());
     });
     this.moderation?.maybeSample(id);
     return this.get(agentId, id);
@@ -306,7 +316,11 @@ export class Market {
          ORDER BY price_credits DESC, created_at LIMIT ?`,
       )
       .all(forAgent ?? "", forAgent ?? "", kind ?? null, kind ?? null, limit) as unknown as MissionRow[];
-    return rows.map((r) => this.info(r));
+    const records = new Map<string, RequesterRecord>();
+    return rows.map((r) => {
+      if (!records.has(r.requester_id)) records.set(r.requester_id, this.requesterRecord(r.requester_id));
+      return { ...this.info(r), requester: records.get(r.requester_id) };
+    });
   }
 
   take(agentId: string, missionId: string): MissionInfo {
@@ -320,6 +334,19 @@ export class Market {
         level >= m.min_level,
         "certification_required",
         `This mission needs level ${m.min_level} in ${m.kind} (yours: ${level}). Take the exam with take_exam.`,
+      );
+    }
+    if (m.model) {
+      const p = this.certifier?.profile(agentId);
+      check(
+        p?.declaredModel === m.model,
+        "model_required",
+        `This mission asks for a solver running ${m.model} (you declared ${p?.declaredModel ?? "none"}; see declare_model).`,
+      );
+      check(
+        p.conformity?.status !== "below_peers",
+        "model_required",
+        `This mission asks for ${m.model}, and your answers were ranked below the other agents declaring it.`,
       );
     }
     const bond = this.bondFor(m.price_credits);
@@ -361,10 +388,11 @@ export class Market {
     tx(this.db, () => {
       const res = this.db
         .prepare(
-          `UPDATE missions SET status = 'delivered', delivery_hash = ?, delivery_mime = ?, delivered_at = ?, solver_bond = 0
+          `UPDATE missions SET status = 'delivered', delivery_hash = ?, delivery_mime = ?, delivered_at = ?, solver_bond = 0,
+             solver_model = (SELECT model FROM agents WHERE agent_id = ?)
            WHERE id = ? AND solver_id = ? AND status = 'in_progress'`,
         )
-        .run(input.deliveryHash, input.deliveryMime, now(), missionId, agentId);
+        .run(input.deliveryHash, input.deliveryMime, now(), agentId, missionId, agentId);
       check(res.changes === 1, "invalid_state", `Mission is ${m.status}; deliver once you have the spec`);
       this.c.credit(agentId, m.solver_bond); // the bond comes back with the delivery
       this.message(missionId, "delivery", agentId, m.requester_id, input.envelope);
@@ -481,6 +509,53 @@ export class Market {
     };
   }
 
+  /**
+   * The agent's state for GET /v1/events: statuses and ids only, no content, no side effect other
+   * than the usual deadline sweep (no fake dispute is handed out here, unlike the inbox).
+   */
+  events(agentId: string): AgentEvents {
+    this.sweep();
+    const missions = (
+      this.db
+        .prepare(
+          `SELECT id, status, requester_id, verdict,
+             (SELECT GROUP_CONCAT(d.mediator_id) FROM mediations d WHERE d.mission_id = missions.id AND d.verdict IS NULL) AS mediators
+           FROM missions WHERE (requester_id = ? OR solver_id = ?) AND honeypot_id IS NULL
+             AND (status IN (${ACTIVE.map(() => "?").join(",")}) OR closed_at >= ?)
+           ORDER BY created_at`,
+        )
+        .all(agentId, agentId, ...ACTIVE, minutesAgo(24 * 60)) as {
+        id: string;
+        status: MissionStatus;
+        requester_id: string;
+        verdict: string | null;
+        mediators: string | null;
+      }[]
+    );
+    const messages = (
+      this.db.prepare(`SELECT GROUP_CONCAT(id) AS ids, COUNT(*) AS n FROM messages WHERE to_id = ? AND envelope IS NOT NULL`).get(agentId) as {
+        ids: string | null;
+        n: number;
+      }
+    );
+    const state = {
+      missions: missions.map((m) => ({
+        missionId: m.id,
+        role: m.requester_id === agentId ? ("requester" as const) : ("solver" as const),
+        status: m.status,
+      })),
+      messages: messages.n,
+      mediations: this.pendingMediations(agentId).map((d) => `${d.missionId}:${d.round}`),
+      rankings: this.certifier?.pendingRankings(agentId).map((r) => r.groupId) ?? [],
+      moderations: this.moderation?.pending(agentId).map((k) => k.caseId) ?? [],
+    };
+    // The cursor also covers what the summary leaves out: which messages, verdicts and mediators.
+    const cursor = sha256(
+      JSON.stringify([state, messages.ids, missions.map((m) => [m.verdict, m.mediators])]),
+    ).slice(0, 32);
+    return { cursor, ...state };
+  }
+
   /** Erases a fetched message's ciphertext. The row stays as proof that it was sent. */
   ack(agentId: string, messageId: string) {
     const res = this.db
@@ -560,14 +635,40 @@ export class Market {
           .all(since) as { kind: string; avg: number; pairs: number }[]
       ).map((r) => [r.kind, r]),
     );
+    // Per model the solvers declared at delivery, pair-weighted the same way, shown only above a few pairs.
+    const perModel = this.db
+      .prepare(
+        `SELECT kind, model, AVG(p) AS avg, COUNT(*) AS pairs, SUM(n) AS accepted FROM (
+           SELECT kind, solver_model AS model, AVG(price_credits) AS p, COUNT(*) AS n FROM missions
+           WHERE status = 'accepted' AND honeypot_id IS NULL AND control_id IS NULL AND closed_at >= ? AND solver_model IS NOT NULL
+           GROUP BY kind, solver_model, requester_id, solver_id)
+         GROUP BY kind, model HAVING COUNT(*) >= ? ORDER BY avg DESC`,
+      )
+      .all(since, this.cfg.modelRateMinPairs) as { kind: string; model: string; avg: number; pairs: number; accepted: number }[];
     return rows.map((r) => {
       const p = byPair.get(r.kind);
       return {
         ...r,
         avgAcceptedPrice: p ? Math.round(p.avg * 10) / 10 : null,
         pairs30d: p?.pairs ?? 0,
+        models: perModel
+          .filter((x) => x.kind === r.kind)
+          .map((x) => ({ model: x.model, avgAcceptedPrice: Math.round(x.avg * 10) / 10, pairs30d: x.pairs, accepted30d: x.accepted })),
       };
     });
+  }
+
+  /** What a requester has proven by paying (controls and fake disputes excluded). */
+  requesterRecord(agentId: string): RequesterRecord {
+    const r = this.db
+      .prepare(
+        `SELECT COALESCE(SUM(status = 'accepted'), 0) AS paid,
+                COUNT(DISTINCT CASE WHEN status = 'accepted' THEN solver_id END) AS paidSolvers,
+                COALESCE(SUM(contest_reason IS NOT NULL), 0) AS contested
+         FROM missions WHERE requester_id = ? AND control_id IS NULL AND honeypot_id IS NULL`,
+      )
+      .get(agentId) as unknown as RequesterRecord;
+    return { paid: r.paid, paidSolvers: r.paidSolvers, contested: r.contested };
   }
 
   /** Daily history of accepted missions per kind, for the public market page. */
@@ -763,6 +864,7 @@ export class Market {
       createdAt: m.created_at,
     };
     if (m.min_level > 0) info.minLevel = m.min_level;
+    if (m.model) info.model = m.model;
     if (m.status === "open") info.bondCredits = this.bondFor(m.price_credits);
     else if (m.solver_bond > 0 && involved) info.bondCredits = m.solver_bond;
     if (involved) {
@@ -983,7 +1085,8 @@ export class Market {
         )
         .run(now(), reason, missionId);
       if (res.changes !== 1) throw new TroqoError("invalid_state", `Mission is already ${m.status}`);
-      const half = Math.floor(m.price_credits / 2);
+      // The odd credit goes to the solver: contesting must never be the cheaper way to get the work.
+      const half = Math.ceil(m.price_credits / 2);
       this.c.credit(m.solver_id!, half + m.solver_deposit);
       this.c.credit(m.requester_id, m.price_credits - half + m.requester_deposit);
       for (const p of this.db

@@ -26,8 +26,8 @@ describe("community mediation starts with enough active agents", () => {
     const id = await delivered(m, req, sol, 9);
     const r = await req.review(id, "contest", "The function does not handle empty strings.");
     expect(r.status).toBe("split");
-    expect((await req.account()).credits).toBe(6); // 10 - 9 escrow + 5 back (the odd credit goes to the requester)
-    expect((await sol.account()).credits).toBe(2 + 4); // bond returned on delivery, plus half rounded down
+    expect((await req.account()).credits).toBe(5); // 10 - 9 escrow + 4 back
+    expect((await sol.account()).credits).toBe(2 + 5); // bond returned on delivery, plus half rounded up: contesting is never cheaper
     expect(m.troqo.ctx.db.prepare(`SELECT COUNT(*) AS n FROM mediations`).get()).toEqual({ n: 0 });
     const pub = (await (await fetch(`${m.url}/v1/market`)).json()) as { community: { activeAgents: number; threshold: number; active: boolean } };
     expect(pub.community).toEqual({ activeAgents: 2, threshold: 10, active: false });

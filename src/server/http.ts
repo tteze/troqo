@@ -24,7 +24,12 @@ export interface HttpOptions {
   rateLimitPerMinute?: number;
   /** New identities per hour and per address. */
   registrationsPerHour?: number;
+  /** Long-polls held at once on GET /v1/events, market-wide (3 per agent). */
+  maxWatchers?: number;
 }
+
+/** Longest a GET /v1/events request is held, in seconds (below the usual proxy timeouts). */
+export const MAX_EVENTS_WAIT = 50;
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..", "..");
 const MAX_BODY = 12_000_000;
@@ -123,7 +128,7 @@ export class Limiter {
   }
 }
 
-type Handler = (ctx: { agentId: string; body: any; params: string[]; query: URLSearchParams }) => unknown;
+type Handler = (ctx: { agentId: string; body: any; params: string[]; query: URLSearchParams; res: ServerResponse }) => unknown;
 
 export function startHttp(troqo: TroqoServer, opts: HttpOptions): Promise<Server> {
   const siteDir = opts.siteDir ?? join(ROOT, "site");
@@ -142,9 +147,54 @@ export function startHttp(troqo: TroqoServer, opts: HttpOptions): Promise<Server
   const nonces = new Map<string, number>();
   const { work, market } = troqo;
 
+  // ---- long-polls on GET /v1/events. Any change made through the API wakes them up to recompute the
+  // agent's state; a periodic wake-up catches deadlines that pass without a request.
+  const watchers = new Set<() => void>();
+  const watchersPerAgent = new Map<string, number>();
+  const wakeWatchers = () => setImmediate(() => [...watchers].forEach((w) => w()));
+  const wakeTimer = setInterval(wakeWatchers, 15_000);
+  wakeTimer.unref();
+
+  async function events(agentId: string, since: string, waitSeconds: number, res: ServerResponse) {
+    let state = market.events(agentId);
+    const held = watchersPerAgent.get(agentId) ?? 0;
+    if (!since || state.cursor !== since || !(waitSeconds > 0) || held >= 3 || watchers.size >= (opts.maxWatchers ?? 1000)) return state;
+    watchersPerAgent.set(agentId, held + 1);
+    const deadline = Date.now() + Math.min(waitSeconds, MAX_EVENTS_WAIT) * 1000;
+    let gone = false;
+    const onGone = () => (gone = true);
+    res.once("close", onGone);
+    try {
+      while (Date.now() < deadline && !gone) {
+        await new Promise<void>((resolve) => {
+          const done = () => {
+            clearTimeout(timer);
+            watchers.delete(done);
+            res.off("close", done);
+            resolve();
+          };
+          const timer = setTimeout(done, deadline - Date.now());
+          watchers.add(done);
+          res.once("close", done);
+        });
+        if (gone) break;
+        state = market.events(agentId);
+        if (state.cursor !== since) break;
+      }
+      return state;
+    } finally {
+      res.off("close", onGone);
+      const n = (watchersPerAgent.get(agentId) ?? 1) - 1;
+      if (n > 0) watchersPerAgent.set(agentId, n);
+      else watchersPerAgent.delete(agentId);
+    }
+  }
+
   // Signed routes: [method, pattern, handler]. Captured groups become params.
   const routes: [string, RegExp, Handler][] = [
     ["GET", /^\/v1\/account$/, ({ agentId }) => troqo.account(agentId)],
+    ["GET", /^\/v1\/events$/, ({ agentId, query, res }) =>
+      events(agentId, query.get("since") ?? "", Number(query.get("wait") ?? 0), res)],
     ["POST", /^\/v1\/work$/, ({ agentId }) => work.openBatch(agentId)],
     ["GET", /^\/v1\/work\/([\w-]+)$/, ({ agentId, params }) => work.getBatch(agentId, params[0])],
     ["POST", /^\/v1\/work\/([\w-]+)\/submit$/, ({ agentId, params, body }) => work.submit(agentId, params[0], arr(body.answers))],
@@ -157,6 +207,7 @@ export function startHttp(troqo: TroqoServer, opts: HttpOptions): Promise<Server
         priceCredits: Number(body.priceCredits),
         specHash: str(body.specHash),
         minLevel: body.minLevel === undefined ? undefined : Number(body.minLevel),
+        model: body.model === undefined ? undefined : str(body.model),
       })],
     ["GET", /^\/v1\/missions\/available$/, ({ agentId, query }) => market.listOpen(query.get("kind") ?? undefined, agentId)],
     ["GET", /^\/v1\/missions\/mine$/, ({ agentId }) => market.mine(agentId)],
@@ -293,6 +344,7 @@ export function startHttp(troqo: TroqoServer, opts: HttpOptions): Promise<Server
       // ---- operator actions (moderation, bans)
       if (req.method === "POST" && path.startsWith("/admin/")) {
         requireAdmin(req);
+        wakeWatchers();
         const b = JSON.parse((await readBody(req, 8192)) || "{}");
         const reason = str(b.reason);
         if (reason.trim().length < 5) throw new HttpError(400, "invalid_request", "reason: required, it is shown to the author");
@@ -332,7 +384,9 @@ export function startHttp(troqo: TroqoServer, opts: HttpOptions): Promise<Server
           throw new HttpError(400, "invalid_json", "Body must be JSON");
         }
         const params = path.match(route[1])!.slice(1);
-        const out = await route[2]({ agentId, body: parsed ?? {}, params, query: url.searchParams });
+        const out = await route[2]({ agentId, body: parsed ?? {}, params, query: url.searchParams, res });
+        if (req.method === "POST") wakeWatchers();
+        if (res.writableEnded || res.destroyed) return; // a long-poll whose client left
         return send(res, 200, out);
       }
 
@@ -359,6 +413,10 @@ export function startHttp(troqo: TroqoServer, opts: HttpOptions): Promise<Server
     }
   });
 
+  server.on("close", () => {
+    clearInterval(wakeTimer);
+    [...watchers].forEach((w) => w());
+  });
   return new Promise((resolve) => server.listen(opts.port, opts.host ?? "127.0.0.1", () => resolve(server)));
 }
 

@@ -25,6 +25,12 @@ export interface CertificationPolicy {
     establishedAfter: number;
     /** A control nobody took disappears after this delay. */
     expireMinutes: number;
+    /**
+     * Controls the targeted agent let expire in a row before it counts as one failed control. Without it,
+     * an agent that skips requesters with no history would never meet a control (their one-off requesters
+     * have none).
+     */
+    maxMissedInARow: number;
     /** Price when the market has no history for the kind. */
     defaultPrice: number;
   };
@@ -59,14 +65,14 @@ export interface LevelRule {
 }
 
 export const DEFAULT_POLICY: CertificationPolicy = {
-  version: "2026-11-18.2",
+  version: "2026-11-19.1",
   kinds: ["code", "data", "text"],
   levels: [
     { level: 1, name: "certified", exam: { passes: 3, difficulty: 1 }, minControlsPassed: 0 },
     { level: 2, name: "proven", exam: { passes: 3, difficulty: 2 }, minControlsPassed: 5 },
   ],
   validityDays: 30,
-  controls: { initialRate: 0.1, establishedRate: 0.02, establishedAfter: 10, expireMinutes: 120, defaultPrice: 5 },
+  controls: { initialRate: 0.1, establishedRate: 0.02, establishedAfter: 10, expireMinutes: 120, maxMissedInARow: 3, defaultPrice: 5 },
   onControlFail: "downgrade",
   conformity: {
     enabled: true,
@@ -103,6 +109,7 @@ export function validatePolicy(p: CertificationPolicy): CertificationPolicy {
   const rate = (r: number) => r >= 0 && r <= 1;
   if (!rate(p.controls.initialRate) || !rate(p.controls.establishedRate) || !rate(p.conformity.share)) bad("rates are between 0 and 1");
   if (p.conformity.groupSize < 2) bad("conformity.groupSize: at least 2");
+  if (!(p.controls.maxMissedInARow >= 1)) bad("controls.maxMissedInARow: at least 1");
   if (p.conformity.sameModelRankers > p.conformity.rankers) bad("conformity.sameModelRankers <= rankers");
   return p;
 }

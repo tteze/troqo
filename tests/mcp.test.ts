@@ -49,6 +49,7 @@ describe("local MCP server", () => {
       "submit_tasks",
       "take_exam",
       "take_mission",
+      "wait_for_update",
     ]);
   });
 
@@ -149,5 +150,66 @@ describe("client updates", () => {
     expect(VERSION).toBe(pkg.version);
     m = await market();
     expect((await fetch(`${m.url}/health`)).headers.get("x-troqo-version")).toBe(VERSION);
+  });
+});
+
+describe("listening instead of polling", () => {
+  it("holds GET /v1/events until the agent's state changes", async () => {
+    m = await market();
+    const req = await m.agent(20);
+    const sol = await m.agent(5);
+    const posted = await req.postMission(SPEC);
+    const first = await req.events();
+    expect(first.missions).toEqual([{ missionId: posted.missionId, role: "requester", status: "open" }]);
+
+    const t0 = Date.now();
+    const held = req.events(first.cursor, 20);
+    await new Promise((r) => setTimeout(r, 200));
+    await sol.takeMission(posted.missionId);
+    const next = await held;
+    expect(Date.now() - t0).toBeLessThan(5000); // woken by the take, not by the timeout
+    expect(next.missions[0].status).toBe("taken");
+
+    const same = await req.events(next.cursor, 1); // nothing moves: answers after the wait
+    expect(same.cursor).toBe(next.cursor);
+  });
+
+  it("wakes a waiting requester and solver with what to do next", async () => {
+    m = await market();
+    const req = await m.agent(20);
+    const sol = await m.agent(5);
+    const posted = await req.postMission(SPEC);
+    const waiting = req.waitForUpdate({ missionId: posted.missionId, timeoutSeconds: 20 });
+    await new Promise((r) => setTimeout(r, 200));
+    await sol.takeMission(posted.missionId);
+    const r = await waiting;
+    expect(r.changes[0]).toContain("open → taken");
+
+    // The requester's wait synced, so the spec is already handed over: the solver's wait answers at once.
+    const s = await sol.waitForUpdate({ missionId: posted.missionId, timeoutSeconds: 5 });
+    expect(s.changes[0]).toContain("the spec arrived");
+    expect((await sol.mission(posted.missionId)).local.spec).toBeDefined();
+
+    const quiet = await sol.waitForUpdate({ timeoutSeconds: 1 });
+    expect(quiet.timedOut).toBe(true);
+  });
+
+  it("lets the local MCP server hand over the spec as soon as a solver takes the mission", async () => {
+    m = await market();
+    const reqClient = await m.agent(20);
+    const [clientT, serverT] = InMemoryTransport.createLinkedPair();
+    await buildMcpServer(reqClient, { listen: true }).connect(serverT);
+    const mcp = new Client({ name: "agent", version: "0" });
+    await mcp.connect(clientT);
+    const posted = (await mcp.callTool({ name: "post_mission", arguments: { ...SPEC, price_credits: 4 } })) as Result;
+    const text = posted.content.map((c) => c.text).join("\n");
+    expect(text).toContain("troqo wait ");
+    const id = /Mission (\S+)/.exec(text)![1];
+
+    const sol = await m.agent(0);
+    await sol.takeMission(id);
+    const r = await sol.waitForUpdate({ missionId: id, timeoutSeconds: 10 }); // nobody calls a tool on the requester side
+    expect(r.changes[0]).toContain("in_progress: the spec arrived");
+    await mcp.close();
   });
 });

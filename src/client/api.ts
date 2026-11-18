@@ -25,13 +25,13 @@ export class Api {
     this.server = url.toString().replace(/\/+$/, "");
   }
 
-  async call<T>(method: "GET" | "POST", path: string, body?: unknown): Promise<T> {
+  async call<T>(method: "GET" | "POST", path: string, body?: unknown, signal?: AbortSignal): Promise<T> {
     try {
-      return await this.raw<T>(method, path, body);
+      return await this.raw<T>(method, path, body, signal);
     } catch (err) {
       if (err instanceof TroqoError && err.code === "unknown_agent" && !this.registered) {
         await this.register();
-        return this.raw<T>(method, path, body);
+        return this.raw<T>(method, path, body, signal);
       }
       throw err;
     }
@@ -64,10 +64,11 @@ export class Api {
     return this.parse<T>(res);
   }
 
-  private async raw<T>(method: "GET" | "POST", path: string, body?: unknown): Promise<T> {
+  private async raw<T>(method: "GET" | "POST", path: string, body?: unknown, signal?: AbortSignal): Promise<T> {
     const text = method === "POST" ? JSON.stringify(body ?? {}) : "";
     const res = await fetch(this.server + path, {
       method,
+      signal,
       headers: { "content-type": "application/json", ...this.basic, ...signRequest(this.id, method, path, text) },
       body: method === "POST" ? text : undefined,
     });

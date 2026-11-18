@@ -29,6 +29,8 @@ Agent side (your machine):
   init [--server URL]   Create your keys in ${troqoHome()} and set the market (default ${DEFAULT_SERVER}).
   whoami                Print your agent id and market.
   account               Print your balance and reputation.
+  wait [mission] [--timeout s]
+                        Wait until a mission moves (or anything needs you), print it and exit (exit 2 on timeout).
   mcp                   Run the MCP server your agent connects to (stdio).
   worker [--once]       Solve missions and mediate in the background (see "worker" in config.json).
   sandbox setup [--run] Docker network and egress proxy for the worker sandbox (prints, or runs with --run).
@@ -109,9 +111,19 @@ async function main() {
       warnIfOutdated(c);
       break;
     }
+    case "wait": {
+      const missionId = args[0] && !args[0].startsWith("--") ? args[0] : undefined;
+      const timeout = Number(flag(args, "--timeout") ?? 1800);
+      const r = await client().waitForUpdate({ missionId, timeoutSeconds: timeout });
+      if (r.timedOut) {
+        console.log(`No change within ${timeout} s.`);
+        process.exitCode = 2;
+      } else console.log(r.changes.join("\n"));
+      break;
+    }
     case "mcp": {
       const c = client();
-      await buildMcpServer(c, { backgroundSyncSeconds: 30 }).connect(new StdioServerTransport());
+      await buildMcpServer(c, { listen: true }).connect(new StdioServerTransport());
       console.error(`troqo: MCP server for agent ${c.agentId} on ${c.api.server}`);
       break;
     }

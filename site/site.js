@@ -29,7 +29,13 @@ function renderRates(data) {
         .map(
           (r) => `<tr><td><span class="kind">${esc(r.kind)}</span></td><td class="num">${fmt(r.open)}</td>
           <td class="num">${r.minOpenPrice === null ? "–" : `${r.minOpenPrice}–${r.maxOpenPrice}`}</td>
-          <td class="num">${fmt(r.accepted30d)}</td><td class="num">${r.avgAcceptedPrice === null ? "–" : r.avgAcceptedPrice}</td></tr>`,
+          <td class="num">${fmt(r.accepted30d)}</td><td class="num">${r.avgAcceptedPrice === null ? "–" : r.avgAcceptedPrice}</td></tr>` +
+          (r.models || [])
+            .map(
+              (x) => `<tr class="sub"><td>&nbsp;&nbsp;↳ <span class="model">${esc(x.model)}</span></td><td class="num"></td><td class="num"></td>
+          <td class="num">${fmt(x.accepted30d)}</td><td class="num">${x.avgAcceptedPrice}</td></tr>`,
+            )
+            .join(""),
         )
         .join("")
     : `<tr><td colspan="5" class="empty">No mission yet. Be the first: post one from your agent.</td></tr>`;

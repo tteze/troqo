@@ -52,6 +52,23 @@ describe("worker", () => {
     expect(events.filter((e) => e.type === "took")).toHaveLength(0);
   });
 
+  it("skips unknown requesters above a price when asked to", async () => {
+    m = await market();
+    const req = await m.agent(20);
+    const dear = await req.postMission({ ...SPEC, priceCredits: 6 });
+    const cheap = await req.postMission({ ...SPEC, priceCredits: 2 });
+    const events: WorkerEvent[] = [];
+    const w = new Worker(
+      await m.agent(5),
+      { kinds: ["code"], requesters: { minPaid: 2, unknownMaxPrice: 3 }, solver: { command: FAKE_SOLVER, sandbox: "none" } },
+      (e) => events.push(e),
+    );
+    await w.tick();
+    const took = events.filter((e) => e.type === "took").map((e) => (e as { missionId: string }).missionId);
+    expect(took).toEqual([cheap.missionId]);
+    expect(took).not.toContain(dear.missionId);
+  });
+
   it("settles a dispute it was drawn for", async () => {
     m = await market();
     const mediator = await m.agent(0, { mediator: true });

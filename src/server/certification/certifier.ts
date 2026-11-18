@@ -48,7 +48,7 @@ interface ControlRow {
   box_public: string;
   box_private: string;
   delivery: string | null;
-  result: "pass" | "fail" | null;
+  result: "pass" | "fail" | "missed" | null;
   policy_version: string;
 }
 
@@ -248,6 +248,16 @@ export class Certifier {
       .get(missionId) as ControlRow | undefined;
   }
 
+  /** A hidden control the agent let expire. Several in a row count as one failed control. */
+  private missed(k: ControlRow) {
+    const c = this.cert(k.agent_id, k.kind);
+    if (!c) return;
+    this.db.prepare(`UPDATE controls SET result = 'missed', graded_at = ? WHERE id = ?`).run(now(), k.id);
+    this.db.prepare(`UPDATE certifications SET controls_missed = controls_missed + 1 WHERE agent_id = ? AND kind = ?`).run(k.agent_id, k.kind);
+    const n = (this.db.prepare(`SELECT controls_missed AS n FROM certifications WHERE agent_id = ? AND kind = ?`).get(k.agent_id, k.kind) as { n: number }).n;
+    if (n >= this.policy.controls.maxMissedInARow) this.applyResult(k, false);
+  }
+
   /** Applies a graded result to the agent's certification of that kind. */
   private record(k: ControlRow, passed: boolean) {
     this.db.prepare(`UPDATE controls SET result = ?, graded_at = ? WHERE id = ?`).run(passed ? "pass" : "fail", now(), k.id);
@@ -261,12 +271,17 @@ export class Certifier {
       }
       return;
     }
+    this.applyResult(k, passed);
+  }
+
+  /** What a graded (or repeatedly missed) hidden control does to the certification. */
+  private applyResult(k: ControlRow, passed: boolean) {
     const c = this.cert(k.agent_id, k.kind);
     if (!c) return;
     if (passed) {
       this.db
         .prepare(
-          `UPDATE certifications SET controls_passed = controls_passed + 1, streak = streak + 1, expires_at = ?
+          `UPDATE certifications SET controls_passed = controls_passed + 1, streak = streak + 1, controls_missed = 0, expires_at = ?
            WHERE agent_id = ? AND kind = ?`,
         )
         .run(plusMinutes(now(), this.policy.validityDays * 24 * 60), k.agent_id, k.kind);
@@ -274,7 +289,7 @@ export class Certifier {
       const level = this.policy.onControlFail === "revoke" ? 0 : Math.max(0, c.level - 1);
       this.db
         .prepare(
-          `UPDATE certifications SET controls_failed = controls_failed + 1, streak = 0, level = ?, policy_version = ?
+          `UPDATE certifications SET controls_failed = controls_failed + 1, streak = 0, controls_missed = 0, level = ?, policy_version = ?
            WHERE agent_id = ? AND kind = ?`,
         )
         .run(level, this.policy.version, k.agent_id, k.kind);
@@ -291,6 +306,8 @@ export class Certifier {
       .all(minutesAgo(this.policy.controls.expireMinutes)) as { id: string }[]) {
       this.db.prepare(`UPDATE missions SET status = 'cancelled', closed_at = ?, outcome_reason = 'control expired' WHERE id = ?`).run(now(), r.id);
       this.retire(r.id);
+      const k = this.control(r.id);
+      if (k?.purpose === "check") this.missed(k);
     }
     // Spec handover.
     for (const r of this.db
@@ -708,6 +725,7 @@ export class Certifier {
         policyVersion: c.policy_version,
       })),
       record,
+      asRequester: this.market.requesterRecord(agentId),
     };
   }
 }

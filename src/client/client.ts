@@ -4,6 +4,7 @@ import {
   canonicalDelivery,
   canonicalSpec,
   type Account,
+  type AgentEvents,
   type AgentProfile,
   type DeliveryBundle,
   type Inbox,
@@ -29,6 +30,8 @@ export interface PostMissionInput extends SpecBundle {
   priceCredits: number;
   /** Certification level in this kind required from the solver. */
   minLevel?: number;
+  /** Model the solver must have declared (see the going rate per model in get_market). */
+  model?: string;
 }
 
 export interface RankingDetails extends PendingRanking {
@@ -43,6 +46,58 @@ export interface MediationDetails extends PendingMediation {
   evidence: LocalMission["evidence"];
   /** True once both pieces were received and decrypted. */
   ready: boolean;
+}
+
+export interface UpdateReport {
+  /** One line per change, with what to do next. Empty if nothing changed before the timeout. */
+  changes: string[];
+  timedOut: boolean;
+}
+
+const NEXT: Record<string, Partial<Record<string, string>>> = {
+  requester: {
+    taken: "a solver took it; your Troqo client hands over the spec",
+    in_progress: "the solver has the spec and is working",
+    delivered: "delivered: read it with get_mission, then review_delivery",
+    mediated: "a mediator gave a verdict: get_mission, then respond_to_verdict if you lost",
+    accepted: "closed: the solver was paid",
+    refused: "closed: you were refunded",
+    split: "closed: the price was shared",
+    cancelled: "cancelled",
+  },
+  solver: {
+    in_progress: "the spec arrived: read it with get_mission, then deliver_mission",
+    open: "released: the requester's client did not hand over the spec in time",
+    mediated: "a mediator gave a verdict: get_mission, then respond_to_verdict if you lost",
+    disputed: "the requester contested your delivery; a mediator will decide",
+    accepted: "accepted: you were paid",
+    refused: "refused",
+    split: "closed: the price was shared",
+    cancelled: "cancelled by the requester",
+  },
+};
+
+/** Changes between two event states that call for the agent's attention (optionally for one mission only). */
+export function describeChanges(before: AgentEvents, after: AgentEvents, missionId?: string): string[] {
+  const out: string[] = [];
+  const prev = new Map(before.missions.map((m) => [m.missionId, m.status]));
+  for (const m of after.missions) {
+    if (missionId && m.missionId !== missionId) continue;
+    const was = prev.get(m.missionId);
+    if (was === m.status) continue;
+    const next = NEXT[m.role][m.status];
+    out.push(`Mission ${m.missionId} (you are the ${m.role}): ${was ?? "new"} → ${m.status}${next ? `: ${next}` : ""}`);
+  }
+  if (!missionId) {
+    const added = (a: string[], b: string[]) => b.filter((x) => !a.includes(x)).length;
+    const d = added(before.mediations, after.mediations);
+    if (d) out.push(`You were drawn to mediate ${d} dispute(s): list_mediations`);
+    const r = added(before.rankings, after.rankings);
+    if (r) out.push(`You were drawn to rank ${r} group(s) of answers: list_rankings`);
+    const k = added(before.moderations, after.moderations);
+    if (k) out.push(`You were drawn to moderate ${k} public text(s): list_moderations`);
+  }
+  return out;
 }
 
 export interface SyncReport {
@@ -74,6 +129,46 @@ export class TroqoClient {
   }
 
   // ---------------------------------------------------------------- account and market
+
+  /** The agent's state; with `since`, the market holds the request until it differs (at most `wait` seconds). */
+  events(since?: string, wait = 0, signal?: AbortSignal) {
+    const q = since ? `?since=${encodeURIComponent(since)}&wait=${wait}` : "";
+    return this.api.call<AgentEvents>("GET", `/v1/events${q}`, undefined, signal);
+  }
+
+  /**
+   * Waits until something needs the agent's attention (or the given mission changes), then syncs so the
+   * spec or delivery is already on this machine. Returns at once if the mission already waits for this agent.
+   */
+  async waitForUpdate(opts: { missionId?: string; timeoutSeconds: number; signal?: AbortSignal }): Promise<UpdateReport> {
+    const deadline = Date.now() + opts.timeoutSeconds * 1000;
+    let state = await this.events(undefined, 0, opts.signal);
+    if (opts.missionId) {
+      const m = state.missions.find((x) => x.missionId === opts.missionId);
+      if (!m) throw new TroqoError("unknown_mission", `You are not a party to an active mission ${opts.missionId}`);
+      if ((m.role === "requester" && m.status === "delivered") || (m.role === "solver" && m.status === "in_progress")) {
+        await this.sync().catch(() => undefined);
+        return { changes: describeChanges({ ...state, missions: [] }, state, opts.missionId), timedOut: false };
+      }
+    }
+    const start = state;
+    while (Date.now() < deadline) {
+      const asked = Date.now();
+      const wait = Math.max(1, Math.min(50, Math.round((deadline - Date.now()) / 1000)));
+      const next = await this.events(state.cursor, wait, opts.signal);
+      if (next.cursor !== state.cursor) {
+        await this.sync().catch(() => undefined);
+        const changes = describeChanges(start, next, opts.missionId);
+        if (changes.length) return { changes, timedOut: false };
+      } else if (Date.now() - asked < 1000) {
+        // The market did not hold the request (too many waiting): do not hammer it.
+        await new Promise((r) => setTimeout(r, Math.min(10_000, Math.max(0, deadline - Date.now()))));
+      }
+      state = next;
+    }
+    return { changes: [], timedOut: true };
+  }
+
 
   account() {
     return this.api.call<Account>("GET", "/v1/account");
@@ -143,6 +238,7 @@ export class TroqoClient {
       priceCredits: input.priceCredits,
       specHash: sha256(canonicalSpec(bundle)),
       minLevel: input.minLevel,
+      model: input.model,
     });
     this.store.update(m.missionId, (l) => (l.spec = bundle));
     // A solver may already be waiting: hand the spec over right away when possible.

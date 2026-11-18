@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { generateIdentity, signBoxKey, signRequest } from "../src/shared/crypto.js";
 import { leadingZeroBits, solvePow, verifyPow } from "../src/shared/pow.js";
 import { addressKey } from "../src/server/http.js";
@@ -215,5 +215,85 @@ describe("start-up advance", () => {
     await drain(req);
     expect((await req.account()).advanceCredits).toBe(0);
     await expect(req.postMission({ ...SPEC, priceCredits: 100 })).rejects.toMatchObject({ code: "insufficient_credits" });
+  });
+});
+
+describe("going rate per declared model", () => {
+  it("records the solver's model at delivery and shows a model's rate only above a few pairs", async () => {
+    m = await market({ modelRateMinPairs: 2 });
+    const req = await m.agent(50);
+    const big = await m.agent(10);
+    const small = await m.agent(10);
+    await big.declareModel("big-model");
+    await small.declareModel("small-model");
+    const trade = async (solver: typeof big, price: number) => {
+      const p = await req.postMission({ ...SPEC, priceCredits: price });
+      await solver.takeMission(p.missionId);
+      await req.sync();
+      await solver.sync();
+      await solver.deliver(p.missionId, { mime: "text/plain", content: "done" });
+      await big.declareModel("big-model-renamed"); // changing it later does not rewrite what was delivered
+      await big.declareModel("big-model");
+      await req.review(p.missionId, "accept");
+      return p.missionId;
+    };
+    const id = await trade(big, 8);
+    expect((m.troqo.ctx.db.prepare(`SELECT solver_model FROM missions WHERE id = ?`).get(id) as { solver_model: string }).solver_model).toBe("big-model");
+    await trade(small, 3);
+    expect(m.troqo.market.rates()[0].models).toEqual([]); // one pair per model: not shown
+
+    // A second requester trades with the big model: two pairs, its rate appears.
+    const req2 = await m.agent(20);
+    const p = await req2.postMission({ ...SPEC, priceCredits: 10 });
+    await big.takeMission(p.missionId);
+    await req2.sync();
+    await big.sync();
+    await big.deliver(p.missionId, { mime: "text/plain", content: "done" });
+    await req2.review(p.missionId, "accept");
+    expect(m.troqo.market.rates()[0].models).toEqual([{ model: "big-model", avgAcceptedPrice: 9, pairs30d: 2, accepted30d: 2 }]);
+  });
+
+  it("lets a requester ask for a declared model, and keeps out solvers ranked below their peers", async () => {
+    m = await market();
+    const req = await m.agent(20);
+    const p = await req.postMission({ ...SPEC, priceCredits: 4, model: "Big-Model" });
+    expect((await req.mission(p.missionId)).model).toBe("big-model");
+    await expect(req.postMission({ ...SPEC, model: "not a model!" })).rejects.toMatchObject({ code: "invalid_mission" });
+
+    const other = await m.agent(0);
+    await expect(other.takeMission(p.missionId)).rejects.toMatchObject({ code: "model_required" });
+    await other.declareModel("big-model");
+    vi.spyOn(m.troqo.certifier, "profile").mockReturnValueOnce({
+      ...m.troqo.certifier.profile(other.agentId),
+      conformity: { groups: 5, averageScore: 0.1, status: "below_peers" },
+    });
+    await expect(other.takeMission(p.missionId)).rejects.toMatchObject({ code: "model_required" });
+    await other.takeMission(p.missionId);
+  });
+});
+
+describe("track records instead of bad marks", () => {
+  it("shows a new identity as unknown, and a requester's paid and contested missions to solvers", async () => {
+    m = await market({ communityMinActiveAgents: 30 });
+    const req = await m.agent(30);
+    const sol = await m.agent(10);
+    expect((await req.account()).reputation).toBeNull(); // unknown, not a perfect 1.0
+    const [first] = await (async () => (await req.postMission({ ...SPEC, priceCredits: 4 }), sol.listMissions()))();
+    expect(first.requester).toEqual({ paid: 0, paidSolvers: 0, contested: 0 });
+
+    const run = async (decision: "accept" | "contest") => {
+      const p = await req.postMission({ ...SPEC, priceCredits: 4 });
+      await sol.takeMission(p.missionId);
+      await req.sync();
+      await sol.sync();
+      await sol.deliver(p.missionId, { mime: "text/plain", content: "done" });
+      await req.review(p.missionId, decision, decision === "contest" ? "This does not slugify anything." : undefined);
+    };
+    await run("accept");
+    await run("contest");
+    const [again] = await sol.listMissions();
+    expect(again.requester).toEqual({ paid: 1, paidSolvers: 1, contested: 1 });
+    expect((await sol.profile(req.agentId)).asRequester).toEqual({ paid: 1, paidSolvers: 1, contested: 1 });
+    expect((await sol.account()).reputation).toBe(1); // solved one: now it has a track record
   });
 });

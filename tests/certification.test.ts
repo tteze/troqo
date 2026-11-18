@@ -6,7 +6,7 @@ import type { TroqoClient } from "../src/client/client.js";
 import { BUG_BASES, makeBugTask, PREDICT_TEMPLATES } from "../src/server/certification/code-exams.js";
 import { corruptAnswer, extractJson, GENERATORS, sameJson } from "../src/server/certification/generators.js";
 import { DEFAULT_POLICY, loadPolicy, validatePolicy, type CertificationPolicy } from "../src/server/certification/policy.js";
-import { market, SPEC, type TestMarket } from "./helpers.js";
+import { backdate, market, SPEC, type TestMarket } from "./helpers.js";
 
 let m: TestMarket;
 afterEach(() => m?.close());
@@ -204,6 +204,25 @@ describe("hidden controls", () => {
     await mediator.mediate(control.missionId, "refuse", "The answer gives no data at all.");
     expect((await a.mission(control.missionId)).status).toBe("refused");
     expect((await mediator.account()).credits).toBe(1);
+    expect((await a.profile()).certifications[0]).toMatchObject({ level: 0, controlsFailed: 1 });
+  });
+});
+
+describe("skipping hidden controls", () => {
+  it("counts controls let expire in a row as one failed control", async () => {
+    m = await market({}, policy({ controls: { ...DEFAULT_POLICY.controls, initialRate: 1, maxMissedInARow: 2 } }));
+    const a = await m.agent(10);
+    await certify(m, a);
+    const skip = async () => {
+      await solveRealMission(m, a, "data"); // queues a control for a
+      const [control] = await a.listMissions();
+      expect(control.requester).toEqual({ paid: 0, paidSolvers: 0, contested: 0 }); // looks like any newcomer
+      backdate(m, `UPDATE missions SET created_at = ? WHERE id = ?`, control.missionId);
+      await a.listMissions(); // the sweep retires it
+    };
+    await skip();
+    expect((await a.profile()).certifications[0]).toMatchObject({ level: 1, controlsFailed: 0 });
+    await skip();
     expect((await a.profile()).certifications[0]).toMatchObject({ level: 0, controlsFailed: 1 });
   });
 });

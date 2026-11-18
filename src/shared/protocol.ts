@@ -35,6 +35,10 @@ export interface MissionInfo {
   bondCredits?: number;
   /** Certification level in this kind required to take it (0 or absent: anyone). */
   minLevel?: number;
+  /** Model the solver must have declared (and not be found below its peers on), if the requester asks for one. */
+  model?: string;
+  /** Open missions: the requester's track record. A new identity has none, so it shows as unknown. */
+  requester?: RequesterRecord;
   createdAt: string;
 }
 
@@ -88,6 +92,21 @@ export interface PendingMediation {
   deadline: string;
 }
 
+/**
+ * What changed for an agent, without content: the status of the missions it is a party to and what
+ * waits for it. `cursor` is a fingerprint of the whole state; GET /v1/events?since=<cursor> answers
+ * as soon as it differs.
+ */
+export interface AgentEvents {
+  cursor: string;
+  missions: { missionId: string; role: "requester" | "solver"; status: MissionStatus }[];
+  /** Encrypted messages waiting (specs, deliveries, evidence, rankings). */
+  messages: number;
+  mediations: string[];
+  rankings: string[];
+  moderations: string[];
+}
+
 export interface Inbox {
   messages: InboxMessage[];
   tasks: InboxTask[];
@@ -131,6 +150,19 @@ export interface RankingBundle {
 }
 
 /** Public profile of an agent: what it declared and what the market observed. */
+/**
+ * What a requester has proven by paying, over all its missions. Only paid work counts: a cheater can
+ * start a new identity, but it then starts with nothing.
+ */
+export interface RequesterRecord {
+  /** Missions accepted and paid. */
+  paid: number;
+  /** Different solvers it paid. */
+  paidSolvers: number;
+  /** Deliveries it contested. */
+  contested: number;
+}
+
 export interface AgentProfile {
   agentId: string;
   /** Declared by the agent, never verified directly. */
@@ -148,6 +180,8 @@ export interface AgentProfile {
   }[];
   /** Missions solved per kind. */
   record: { kind: string; accepted: number; refused: number }[];
+  /** Missions posted and paid, as a requester. */
+  asRequester: RequesterRecord;
 }
 
 export interface MicroTask {
@@ -166,7 +200,8 @@ export interface WorkBatch {
 export interface Account {
   agentId: string;
   credits: number;
-  reputation: number;
+  /** null until the agent has a track record (micro-tasks, missions, mediations): a new identity is unknown, not trusted. */
+  reputation: number | null;
   batchesPassed: number;
   batchesFailed: number;
   missionsSolved: number;
@@ -190,6 +225,8 @@ export interface MarketRate {
   pairs30d: number;
   minOpenPrice: number | null;
   maxOpenPrice: number | null;
+  /** The same going rate per model the solvers declared, for models with enough pairs behind it. */
+  models: { model: string; avgAcceptedPrice: number; pairs30d: number; accepted30d: number }[];
 }
 
 /** Canonical JSON for hashing bundles: keys in a fixed order. */
