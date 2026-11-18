@@ -154,3 +154,66 @@ describe("rate limits and market rates", () => {
     expect(rate).toMatchObject({ kind: "code", accepted30d: 10, pairs30d: 2, avgAcceptedPrice: 50 });
   });
 });
+
+describe("start-up advance", () => {
+  const drain = async (a: Awaited<ReturnType<TestMarket["agent"]>>) => {
+    // The test bank holds 10 controls and a batch uses 2 an agent has never seen: 5 batches empty it.
+    for (let i = 0; i < 5; i++) {
+      const b = await a.earnCredits();
+      await a.submitWork(b.batchId, allYes(b.tasks));
+    }
+    await expect(a.earnCredits()).rejects.toMatchObject({ code: "task_pool_exhausted" });
+  };
+
+  it("lets an agent with no micro-task left post beyond its balance, then repays from what it earns", async () => {
+    m = await market({ communityMinActiveAgents: 30 });
+    const req = await m.agent(0);
+    await expect(req.postMission({ ...SPEC, priceCredits: 3 })).rejects.toMatchObject({ code: "insufficient_credits" });
+    expect((await req.account()).advanceCredits).toBe(0); // micro-tasks first
+
+    await drain(req);
+    const balance = (await req.account()).credits; // 5 batches × 4 credits
+    expect((await req.account()).advanceCredits).toBe(5);
+    await expect(req.postMission({ ...SPEC, priceCredits: balance + 6 })).rejects.toMatchObject({ code: "insufficient_credits" });
+    const posted = await req.postMission({ ...SPEC, priceCredits: balance + 5 });
+    expect((await req.account()).credits).toBe(-5);
+    expect(m.troqo.work.faucet().minted).toBe(balance + 5); // counted in the daily budget
+
+    // One advance at a time: the next mission waits for the repayment.
+    expect((await req.account()).advanceCredits).toBe(0);
+    await expect(req.postMission({ ...SPEC, priceCredits: 1 })).rejects.toMatchObject({ code: "insufficient_credits" });
+
+    // A cancelled mission refunds the escrow, which repays the advance first.
+    await req.cancelMission(posted.missionId);
+    expect((await req.account()).credits).toBe(balance);
+    const created = m.troqo.market.stats().credits.created as Record<string, number>;
+    expect([created.work, created.advance ?? 0]).toEqual([balance, 0]); // the advance is fully repaid
+  });
+
+  it("pays the solver normally and keeps the debt with the requester", async () => {
+    m = await market({ communityMinActiveAgents: 30 });
+    const req = await m.agent(0);
+    const sol = await m.agent(10); // enough for the bond
+    await drain(req);
+    const balance = (await req.account()).credits;
+    const posted = await req.postMission({ ...SPEC, priceCredits: balance + 4 });
+    await sol.takeMission(posted.missionId);
+    await req.sync();
+    await sol.sync();
+    await sol.deliver(posted.missionId, { mime: "text/plain", content: "export const slugify = (s) => s;" });
+    await req.sync();
+    await req.review(posted.missionId, "accept");
+    expect((await req.account()).credits).toBe(-4);
+    m.troqo.ctx.credit(req.agentId, 6); // credits earned later
+    expect((await req.account()).credits).toBe(2);
+    expect((m.troqo.market.stats().credits.created as Record<string, number>).advance ?? 0).toBe(0);
+  });
+
+  it("stops once community mediation is on", async () => {
+    m = await market({ communityMinActiveAgents: 0 });
+    const req = await m.agent(0);
+    await drain(req);
+    expect((await req.account()).advanceCredits).toBe(0);
+    await expect(req.postMission({ ...SPEC, priceCredits: 100 })).rejects.toMatchObject({ code: "insufficient_credits" });
+  });
+});

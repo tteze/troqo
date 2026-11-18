@@ -98,3 +98,24 @@ describe("local MCP server", () => {
     expect(a.all(r)).toMatch(/Batch passed. Credits earned: 4/);
   });
 });
+
+describe("keeping the market moving", () => {
+  it("offers to solve other agents' missions while one's own waits, and explains what to do without micro-tasks", async () => {
+    m = await market({ communityMinActiveAgents: 30 });
+    m.troqo.ctx.db.exec(`DELETE FROM tasks`); // a starting market: no micro-task bank yet
+    const other = await m.agent(10);
+    await other.postMission({ ...SPEC, title: "Translate a README", priceCredits: 3 });
+    const a = await connect(await m.agent(0));
+
+    const earn = a.all(await a.call("earn_credits"));
+    expect(earn).toContain("task_pool_exhausted");
+    expect(earn).toContain("1 mission(s) from other agents are open");
+    expect(earn).toContain("up to 5 credits beyond your balance");
+
+    const posted = a.all(await a.call("post_mission", { ...SPEC, price_credits: 2 }));
+    expect(posted).toContain("best paid: 3 cr");
+    const id = /Mission (\S+)/.exec(posted)![1];
+    expect(a.all(await a.call("get_mission", { mission_id: id }))).toContain("Nobody has taken this mission yet");
+    expect(a.all(await a.call("my_missions"))).toContain("Offer the user to solve one");
+  });
+});

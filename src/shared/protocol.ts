@@ -173,6 +173,11 @@ export interface Account {
   canMediate: boolean;
   /** Whether mediation and moderation by agents are on (enough active agents on the market). */
   communityActive: boolean;
+  /**
+   * Credits the market would advance you right now to post a mission beyond your balance (start-up
+   * phase, no micro-task left for you). A negative `credits` is an advance being repaid.
+   */
+  advanceCredits: number;
 }
 
 export interface MarketRate {

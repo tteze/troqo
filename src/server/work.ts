@@ -121,7 +121,23 @@ export class Work {
       .run(now(), minutesAgo(this.c.config.workBatchTtlMinutes));
   }
 
-  openBatch(agentId: string): WorkBatch {
+  /** Credits held back by batches still open. */
+  reservedCredits(): number {
+    return (this.c.db.prepare(`SELECT COUNT(*) AS n FROM batches WHERE status = 'awaiting_work'`).get() as { n: number }).n * this.c.config.workBatchSize;
+  }
+
+  /** Why this agent cannot open a micro-task batch right now (an error code), or null if it can. */
+  batchBlocker(agentId: string): string | null {
+    try {
+      this.checkBatch(agentId);
+      return null;
+    } catch (e) {
+      if (e instanceof TroqoError) return e.code;
+      throw e;
+    }
+  }
+
+  private checkBatch(agentId: string) {
     this.sweep();
     const cfg = this.c.config;
     const open = this.c.db
@@ -138,9 +154,7 @@ export class Work {
     );
 
     const { budget, minted } = this.faucet();
-    const reserved = (this.c.db
-      .prepare(`SELECT COUNT(*) AS n FROM batches WHERE status = 'awaiting_work'`)
-      .get() as { n: number }).n * cfg.workBatchSize;
+    const reserved = this.reservedCredits();
     check(
       minted + reserved + cfg.workBatchSize <= budget,
       "faucet_dry",
@@ -152,6 +166,12 @@ export class Work {
     if (real.length < cfg.workBatchSize || gold.length < cfg.goldPerBatch) {
       throw new TroqoError("task_pool_exhausted", "No micro-tasks available for you right now");
     }
+    return { real, gold };
+  }
+
+  openBatch(agentId: string): WorkBatch {
+    const cfg = this.c.config;
+    const { real, gold } = this.checkBatch(agentId);
     const batch = shuffle([...real, ...gold]);
     const id = randomUUID();
     const createdAt = now();

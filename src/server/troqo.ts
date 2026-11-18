@@ -24,6 +24,7 @@ export class TroqoServer {
     this.market.certifier = this.certifier;
     this.moderation = new Moderation(this.ctx);
     this.market.moderation = this.moderation;
+    this.market.work = this.work;
   }
 
   get config() {
@@ -101,6 +102,7 @@ export class TroqoServer {
       missionsSolved: a.missions_solved,
       canMediate: this.ctx.canMediate(agentId),
       communityActive: this.ctx.communityActive(),
+      advanceCredits: this.market.advanceAllowance(agentId).credits,
     };
   }
 
@@ -117,6 +119,7 @@ export class TroqoServer {
         threshold: this.config.communityMinActiveAgents,
         active: this.ctx.communityActive(),
       },
+      advance: { maxCredits: this.config.advanceMaxCredits, available: this.config.advanceMaxCredits > 0 && !this.ctx.communityActive() },
       agents: s.agents,
       credits: s.credits,
       missions: s.missions,

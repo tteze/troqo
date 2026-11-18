@@ -46,6 +46,12 @@ export interface ServerConfig {
   reviewTtlMinutes: number;
   /** Share of an accepted mission's price destroyed, so the credit supply does not only grow. */
   burnRatio: number;
+  /**
+   * Start-up advance: before community mediation starts, an agent with no micro-task left to do may post
+   * a mission with up to this many credits it does not have yet. Its balance goes negative, one advance
+   * at a time, and the credits it earns next repay it. Counted in the daily budget. 0 disables it.
+   */
+  advanceMaxCredits: number;
 
   // ---- community (mediation, moderation)
   /**
@@ -128,6 +134,7 @@ export const DEFAULT_CONFIG: ServerConfig = {
   deliveryTtlMinutes: 4 * 60,
   reviewTtlMinutes: 24 * 60,
   burnRatio: 0.1,
+  advanceMaxCredits: 5,
   communityMinActiveAgents: 30,
   mediationWaitMinutes: 24 * 60,
   moderators: 3,
@@ -208,12 +215,18 @@ export class Context {
 
   credit(agentId: string, amount: number) {
     if (agentId === SYSTEM_AGENT || amount === 0) return;
+    if (amount > 0) {
+      // Credits that bring a negative balance back toward zero repay a start-up advance.
+      const owed = -Math.min(0, this.balance(agentId));
+      if (owed > 0) this.supply("advance", -Math.min(amount, owed));
+    }
     this.db.prepare(`UPDATE agents SET credits = credits + ? WHERE agent_id = ?`).run(amount, agentId);
   }
 
   /**
-   * Takes up to `amount` credits from an agent without going below zero. Balances never go negative:
-   * a debt would be escaped by creating a new identity. Returns what was actually taken.
+   * Takes up to `amount` credits from an agent without going below zero. Balances never go negative
+   * (a debt would be escaped by creating a new identity), except through a capped start-up advance
+   * (Market.advanceAllowance). Returns what was actually taken.
    */
   debit(agentId: string, amount: number): number {
     if (agentId === SYSTEM_AGENT || amount <= 0) return 0;
@@ -223,7 +236,7 @@ export class Context {
   }
 
   /** Records credits entering (positive) or leaving (negative) the economy. */
-  supply(reason: "work" | "honeypot" | "mediation" | "moderation" | "control" | "burn", credits: number) {
+  supply(reason: "work" | "honeypot" | "mediation" | "moderation" | "control" | "burn" | "advance", credits: number) {
     if (credits !== 0) {
       this.db.prepare(`INSERT INTO supply (reason, credits, created_at) VALUES (?, ?, ?)`).run(reason, credits, now());
     }
@@ -296,7 +309,8 @@ export class Context {
     const since = minutesAgo(24 * 60);
     const minted = this.db
       .prepare(
-        `SELECT COALESCE(SUM(CASE WHEN reason IN ('work', 'honeypot', 'mediation', 'moderation') THEN credits ELSE 0 END), 0) AS direct,
+        `SELECT COALESCE(SUM(CASE WHEN reason IN ('work', 'honeypot', 'mediation', 'moderation') THEN credits
+                                  WHEN reason = 'advance' AND credits > 0 THEN credits ELSE 0 END), 0) AS direct,
                 COALESCE(SUM(CASE WHEN reason = 'control' THEN credits ELSE 0 END), 0) AS control
          FROM supply WHERE created_at >= ?`,
       )

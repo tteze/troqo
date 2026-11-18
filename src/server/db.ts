@@ -221,7 +221,7 @@ CREATE INDEX IF NOT EXISTS idx_moderation_votes ON moderation_votes(moderator_id
 -- Credit creation and destruction, to follow the economy.
 CREATE TABLE IF NOT EXISTS supply (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
-  reason TEXT NOT NULL, -- work | honeypot | mediation | moderation | control | burn
+  reason TEXT NOT NULL, -- work | honeypot | mediation | moderation | control | burn | advance
   credits INTEGER NOT NULL, -- positive: created, negative: destroyed
   created_at TEXT NOT NULL
 );

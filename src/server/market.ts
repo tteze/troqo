@@ -3,6 +3,7 @@ import { tx } from "./db.js";
 import { check, Context, minutesAgo, now, plusMinutes, SYSTEM_AGENT } from "./context.js";
 import type { Certifier } from "./certification/certifier.js";
 import type { Moderation } from "./moderation.js";
+import type { Work } from "./work.js";
 import { corruptAnswer, GENERATORS } from "./certification/generators.js";
 import { seal, sha256 } from "../shared/crypto.js";
 import { TroqoError } from "../shared/errors.js";
@@ -102,6 +103,8 @@ export class Market {
   certifier?: Certifier;
   /** Set by TroqoServer. Reviews public titles and summaries. */
   moderation?: Moderation;
+  /** Set by TroqoServer. The start-up advance is only for agents with no micro-task left to do. */
+  work?: Work;
 
   constructor(private readonly c: Context) {}
 
@@ -143,15 +146,20 @@ export class Market {
       .get(agentId, ...ACTIVE) as { n: number };
     check(open.n < this.cfg.maxOpenMissionsPerAgent, "too_many_open_missions", `You already have ${open.n} missions in progress`);
     const balance = this.c.balance(agentId);
-    check(
-      balance >= price,
-      "insufficient_credits",
-      `This mission costs ${price} credits and your balance is ${balance}. Earn credits first: micro-tasks, ` +
-        `solving another agent's mission, or mediating.`,
-    );
+    const advance = Math.max(0, price - balance);
+    if (advance > 0) {
+      const allowance = this.advanceAllowance(agentId);
+      check(
+        advance <= allowance.credits,
+        "insufficient_credits",
+        `This mission costs ${price} credits and your balance is ${balance}. Earn credits first: micro-tasks, ` +
+          `solving another agent's mission, or mediating. ${allowance.reason}`,
+      );
+    }
     const id = randomUUID();
     tx(this.db, () => {
       this.c.credit(agentId, -price);
+      this.c.supply("advance", advance);
       this.db
         .prepare(
           `INSERT INTO missions (id, requester_id, kind, title, summary, price_credits, spec_hash, status, min_level, created_at)
@@ -161,6 +169,36 @@ export class Market {
     });
     this.moderation?.maybeSample(id);
     return this.get(agentId, id);
+  }
+
+  /**
+   * Start-up advance: how many credits this agent may post a mission with beyond its balance, and why.
+   * Only while community mediation is off (the market is starting), only for an agent with no
+   * micro-task it could do instead, one advance at a time, and within the market's daily budget.
+   */
+  advanceAllowance(agentId: string): { credits: number; reason: string } {
+    const max = this.cfg.advanceMaxCredits;
+    const none = (reason: string) => ({ credits: 0, reason });
+    if (max <= 0) return none("");
+    if (this.c.communityActive()) return none("Start-up advances ended when the market reached its community threshold.");
+    const balance = this.c.balance(agentId);
+    if (balance < 0) return none(`You owe ${-balance} credits from a start-up advance: credits you earn repay it first.`);
+    const blocker = this.work?.batchBlocker(agentId) ?? null;
+    if (blocker === null) return none("Micro-tasks are available for you: earn credits with them (earn_credits).");
+    if (blocker === "too_many_open_batches") return none("Finish your pending micro-task batches first.");
+    if (blocker !== "task_pool_exhausted" && blocker !== "daily_work_limit") {
+      return none("No start-up advance either: the market created its credit budget for today.");
+    }
+    const { budget, minted } = this.c.faucet();
+    const room = Math.max(0, budget - minted - (this.work?.reservedCredits() ?? 0));
+    if (room === 0) return none("No start-up advance either: the market created its credit budget for today.");
+    const credits = Math.min(max, room) + balance;
+    return {
+      credits: Math.min(max, room),
+      reason:
+        `No micro-task is left for you, so the market can advance you up to ${Math.min(max, room)} credits ` +
+        `(a mission of up to ${credits} credits); your balance goes negative and the credits you earn next repay it.`,
+    };
   }
 
   /** Cancels a mission before the solver received the spec; the escrow is refunded. */
