@@ -1,4 +1,5 @@
 import { spawn } from "node:child_process";
+import { API_RELAYS } from "./egress-proxy.js";
 
 /**
  * Runs the solver (e.g. `claude -p`) on a prompt read from stdin. With "docker", the process runs in
@@ -16,8 +17,16 @@ export interface DockerSandbox {
   cpus: string;
   /** host:container[:ro] — e.g. the solver's credentials. Always mounted read-only. */
   mounts: string[];
-  /** Names of environment variables passed through (e.g. ANTHROPIC_API_KEY). */
+  /**
+   * Names of environment variables passed through. Do not put API keys here: anything in the
+   * container can be printed by a prompt injection. Use `relay` instead.
+   */
   env: string[];
+  /**
+   * Model APIs reached through the proxy's API relay ("anthropic", "openai"): the real key stays in the
+   * proxy container, the solver only gets the relay URL and a dummy key.
+   */
+  relay: string[];
 }
 
 export interface SolverConfig {
@@ -35,7 +44,10 @@ export const DEFAULT_DOCKER: DockerSandbox = {
   cpus: "1",
   mounts: [],
   env: [],
+  relay: [],
 };
+
+const proxyHost = (proxy: string) => new URL(proxy).hostname;
 
 export function dockerArgs(command: string[], options: Partial<DockerSandbox> = {}): string[] {
   const o = { ...DEFAULT_DOCKER, ...options };
@@ -54,8 +66,15 @@ export function dockerArgs(command: string[], options: Partial<DockerSandbox> = 
     "-e", "HOME=/home/solver",
     "-e", `HTTPS_PROXY=${o.proxy}`,
     "-e", `HTTP_PROXY=${o.proxy}`,
-    "-e", "NO_PROXY=",
+    "-e", `NO_PROXY=${proxyHost(o.proxy)}`,
   ];
+  const relayed = new Set<string>();
+  for (const name of o.relay) {
+    const r = API_RELAYS[name];
+    if (!r) throw new Error(`Unknown API relay "${name}" (known: ${Object.keys(API_RELAYS).join(", ")})`);
+    args.push("-e", `${r.baseUrlEnv}=${o.proxy}/relay/${r.name}${r.baseUrlSuffix}`, "-e", `${r.keyEnv}=troqo-relay-placeholder`);
+    relayed.add(r.keyEnv);
+  }
   for (const m of o.mounts) {
     const [host, container] = m.split(":");
     if (!host || !container) throw new Error(`Invalid mount "${m}": expected host:container`);
@@ -63,6 +82,7 @@ export function dockerArgs(command: string[], options: Partial<DockerSandbox> = 
   }
   for (const name of o.env) {
     if (!/^[A-Z_][A-Z0-9_]*$/.test(name)) throw new Error(`Invalid env var name "${name}"`);
+    if (relayed.has(name)) continue; // the relay provides it; never pass the real key
     args.push("-e", name);
   }
   args.push(o.image, ...command);
@@ -72,12 +92,20 @@ export function dockerArgs(command: string[], options: Partial<DockerSandbox> = 
 /** Commands that create the isolated network and the egress proxy. Run once per machine. */
 export function sandboxSetupCommands(allowHosts: string[], options: Partial<DockerSandbox> = {}): string[][] {
   const o = { ...DEFAULT_DOCKER, ...options };
+  const relays = o.relay.map((name) => {
+    const r = API_RELAYS[name];
+    if (!r) throw new Error(`Unknown API relay "${name}"`);
+    return r;
+  });
   return [
     ["docker", "network", "create", "--internal", o.network],
     [
       "docker", "run", "-d", "--name", "troqo-egress", "--restart", "unless-stopped",
       "--read-only", "--cap-drop", "ALL", "--security-opt", "no-new-privileges",
+      // The real API keys live here, in the proxy, never in the solver's container.
+      ...relays.flatMap((r) => ["-e", r.keyEnv]),
       o.image, "troqo", "egress-proxy", "--port", "3128", "--allow", allowHosts.join(","),
+      ...(relays.length ? ["--relay", relays.map((r) => r.name).join(",")] : []),
     ],
     ["docker", "network", "connect", o.network, "troqo-egress"],
   ];

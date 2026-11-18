@@ -10,6 +10,7 @@ export type MissionStatus =
   | "appealed"
   | "accepted"
   | "refused"
+  | "split" // contested while no mediator could be drawn: the price is shared 50/50
   | "cancelled";
 
 export type Verdict = "accept" | "refuse";
@@ -61,9 +62,17 @@ export interface InboxMessage {
   createdAt: string;
 }
 
+/** The recipient's keys, as the server reports them. Clients check them with verifyAgentKeys before encrypting. */
+export interface RecipientKeys {
+  toId: string;
+  toSignPublic: string;
+  toBoxPublic: string;
+  toBoxSignature: string;
+}
+
 export type InboxTask =
-  | { type: "send_spec"; missionId: string; toId: string; toBoxPublic: string }
-  | { type: "send_evidence"; missionId: string; piece: "spec" | "delivery"; toId: string; toBoxPublic: string };
+  | ({ type: "send_spec"; missionId: string } & RecipientKeys)
+  | ({ type: "send_evidence"; missionId: string; piece: "spec" | "delivery" } & RecipientKeys);
 
 export interface PendingMediation {
   missionId: string;
@@ -85,6 +94,23 @@ export interface Inbox {
   mediations: PendingMediation[];
   /** Conformity groups this agent was drawn to rank. The answers arrive as a "ranking" message. */
   rankings: PendingRanking[];
+  /** Public texts this agent was drawn to moderate. */
+  moderations: PendingModeration[];
+}
+
+export type ModerationVerdict = "keep" | "remove";
+
+/** A public title and summary to review: reported by an agent, or drawn at random among new missions. */
+export interface PendingModeration {
+  caseId: string;
+  missionId: string;
+  kind: string;
+  title: string;
+  summary: string;
+  origin: "report" | "sample";
+  /** The reporter's reason (reports only). */
+  reason: string;
+  deadline: string;
 }
 
 export interface PendingRanking {
@@ -145,6 +171,8 @@ export interface Account {
   batchesFailed: number;
   missionsSolved: number;
   canMediate: boolean;
+  /** Whether mediation and moderation by agents are on (enough active agents on the market). */
+  communityActive: boolean;
 }
 
 export interface MarketRate {

@@ -1,4 +1,4 @@
-import { signRequest, type Identity } from "../shared/crypto.js";
+import { signBoxKey, signRequest, type Identity } from "../shared/crypto.js";
 import { TroqoError } from "../shared/errors.js";
 import { solvePow, type PowChallenge } from "../shared/pow.js";
 
@@ -31,7 +31,12 @@ export class Api {
       const challenge = await this.get<PowChallenge>("/v1/pow");
       const pow = await solvePow(this.id.signPublic, challenge);
       try {
-        await this.raw("POST", "/v1/register", { signPublic: this.id.signPublic, boxPublic: this.id.boxPublic, pow });
+        await this.raw("POST", "/v1/register", {
+          signPublic: this.id.signPublic,
+          boxPublic: this.id.boxPublic,
+          boxSignature: signBoxKey(this.id),
+          pow,
+        });
         break;
       } catch (err) {
         // The difficulty rose while we were working: solve again.

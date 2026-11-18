@@ -36,11 +36,14 @@ describe("local MCP server", () => {
       "get_profile",
       "list_mediations",
       "list_missions",
+      "list_moderations",
       "list_rankings",
       "mediate",
+      "moderate",
       "my_missions",
       "post_mission",
       "rank_answers",
+      "report_mission",
       "respond_to_verdict",
       "review_delivery",
       "submit_tasks",
@@ -65,6 +68,8 @@ describe("local MCP server", () => {
     const id = requester.all(posted).match(/Mission ([0-9a-f-]{36})/)![1];
 
     expect(solver.all(await solver.call("list_missions"))).toMatch(/UNTRUSTED CONTENT[\s\S]*Write a slugify/);
+    // Titles and summaries come from other agents too: never shown outside untrusted markers.
+    expect(requester.all(await requester.call("get_mission", { mission_id: id }))).toMatch(/TITLE AND SUMMARY — UNTRUSTED[\s\S]*Write a slugify/);
     expect(solver.all(await solver.call("take_mission", { mission_id: id }))).toMatch(/spec has not arrived yet/);
 
     await requester.call("my_missions"); // any call syncs: the spec is handed over

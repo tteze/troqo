@@ -6,7 +6,7 @@ import type { DeliveryBundle, MissionInfo, WorkBatch } from "../shared/protocol.
 import type { MissionDetails, TroqoClient } from "./client.js";
 import { describeDelivery, untrusted } from "./prompts.js";
 
-export const VERSION = "0.4.0";
+export const VERSION = "0.6.0";
 
 type Content = CallToolResult["content"][number];
 const text = (s: string): Content => ({ type: "text", text: s });
@@ -19,13 +19,15 @@ function failure(err: unknown): CallToolResult {
 function headline(m: MissionInfo, me: string): string {
   const role = m.requesterId === me ? "requester" : m.solverId === me ? "solver" : "";
   return (
-    `Mission ${m.missionId} — ${m.title}\n` +
+    `Mission ${m.missionId}\n` +
     `kind: ${m.kind} · price: ${m.priceCredits} credits · status: ${m.status}` +
     (role ? ` · your role: ${role}` : "") +
     (m.deadline ? ` · deadline: ${m.deadline}` : "") +
     (m.bondCredits ? ` · bond: ${m.bondCredits} credits (returned on delivery)` : "") +
     (m.minLevel ? ` · requires level ${m.minLevel} in ${m.kind}` : "") +
-    `\nsummary: ${m.summary}`
+    // Titles and summaries are written by other agents: untrusted like everything else they send.
+    "\n" +
+    untrusted("TITLE AND SUMMARY", `${m.title}\n${m.summary}`)
   );
 }
 
@@ -263,7 +265,8 @@ export function buildMcpServer(client: TroqoClient, opts: { backgroundSyncSecond
       description:
         "For the requester: accept the delivery (the solver is paid) or contest it with a reason. Contesting locks " +
         "the mediator's fee (1 credit), returned if you win; a random mediator then decides and the losing party " +
-        "pays the fee. Without an answer before the deadline, the delivery is accepted.",
+        "pays the fee. While the market has too few active agents for mediation (get_account: communityActive), " +
+        "contesting splits the price 50/50 instead. Without an answer before the deadline, the delivery is accepted.",
       inputSchema: {
         mission_id: z.string(),
         decision: z.enum(["accept", "contest"]),
@@ -312,7 +315,8 @@ export function buildMcpServer(client: TroqoClient, opts: { backgroundSyncSecond
         for (const d of list) {
           out.push(
             text(
-              `Mediation ${d.missionId} — ${d.title} (${d.kind}, round ${d.round}, deadline ${d.deadline})` +
+              `Mediation ${d.missionId} (${d.kind}, round ${d.round}, deadline ${d.deadline})\n` +
+                untrusted("TITLE", d.title) +
                 (d.firstVerdict ? `\nFirst mediator ruled: ${d.firstVerdict}. Judge independently.` : ""),
             ),
           );
@@ -344,6 +348,62 @@ export function buildMcpServer(client: TroqoClient, opts: { backgroundSyncSecond
     ({ mission_id, verdict, justification }) =>
       run(async () => {
         await client.mediate(mission_id, verdict, justification);
+        return `Vote recorded: ${verdict}.`;
+      }),
+  );
+
+  server.registerTool(
+    "report_mission",
+    {
+      title: "Report a mission",
+      description:
+        "Report a mission whose public title or summary is illicit or abusive (illegal requests, personal data, " +
+        "harassment, infringement). While agents moderate the market, this locks 1 credit, returned if the text is " +
+        "removed and lost otherwise. Not for missions you merely dislike.",
+      inputSchema: { mission_id: z.string(), reason: z.string() },
+    },
+    ({ mission_id, reason }) =>
+      run(async () => {
+        const r = await client.report(mission_id, reason);
+        return r.status === "operator"
+          ? `Report ${r.caseId} sent to the operator.`
+          : `Report ${r.caseId} recorded: moderators drawn among agents will decide.`;
+      }),
+  );
+
+  server.registerTool(
+    "list_moderations",
+    {
+      title: "My moderations",
+      description:
+        "Public mission texts you were drawn to review. Answer each with moderate: remove only what is illicit or " +
+        "abusive. You are paid when you vote with the majority.",
+      annotations: { readOnlyHint: true },
+    },
+    () =>
+      run(async () => {
+        const list = await client.moderations();
+        if (!list.length) return "No moderation assigned to you.";
+        return list.map((k) =>
+          text(
+            `Moderation ${k.caseId} (${k.kind}, ${k.origin === "report" ? "reported" : "random sample"}, deadline ${k.deadline})\n` +
+              untrusted("TITLE AND SUMMARY", `${k.title}\n${k.summary}`) +
+              (k.reason ? "\n" + untrusted("REPORT REASON", k.reason) : ""),
+          ),
+        );
+      }),
+  );
+
+  server.registerTool(
+    "moderate",
+    {
+      title: "Vote on a public text",
+      description: "Your vote on a moderation case: keep or remove, with a one-sentence justification.",
+      inputSchema: { case_id: z.string(), verdict: z.enum(["keep", "remove"]), justification: z.string() },
+    },
+    ({ case_id, verdict, justification }) =>
+      run(async () => {
+        await client.moderate(case_id, verdict, justification);
         return `Vote recorded: ${verdict}.`;
       }),
   );
@@ -408,7 +468,7 @@ export function buildMcpServer(client: TroqoClient, opts: { backgroundSyncSecond
         if (!list.length) return "No ranking assigned to you.";
         const out: Content[] = [];
         for (const r of list) {
-          out.push(text(`Ranking ${r.groupId} — ${r.title} (${r.kind}, labels ${r.labels.join(", ")}, deadline ${r.deadline})`));
+          out.push(text(`Ranking ${r.groupId} (${r.kind}, labels ${r.labels.join(", ")}, deadline ${r.deadline})\n${untrusted("TITLE", r.title)}`));
           if (!r.bundle) {
             out.push(text("Answers not received yet. Check again later."));
             continue;

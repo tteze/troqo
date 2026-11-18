@@ -192,11 +192,17 @@ describe("checking mediators with fake disputes", () => {
         verdict: "accept",
       },
     ]);
+    // The known verdict of a fake dispute (banked or generated), as only the server knows it.
+    const truth = (missionId: string) =>
+      (m.troqo.ctx.db
+        .prepare(`SELECT h.verdict FROM missions x JOIN honeypots h ON h.id = x.honeypot_id WHERE x.id = ?`)
+        .get(missionId) as { verdict: "accept" | "refuse" }).verdict;
     const med = await m.agent(0, { mediator: true });
     await med.sync();
     const [d1] = await med.mediations();
     expect(d1.ready).toBe(true);
-    const wrong = d1.title.startsWith("Translate") ? "accept" : "refuse";
+    expect((await med.mission(d1.missionId)).requesterId).toBe(""); // mediators never see the parties
+    const wrong = truth(d1.missionId) === "accept" ? "refuse" : "accept";
     await med.mediate(d1.missionId, wrong, "Judged quickly without reading.");
     const after = await med.account();
     expect(after.credits).toBe(0);
@@ -204,7 +210,7 @@ describe("checking mediators with fake disputes", () => {
 
     await med.sync();
     const [d2] = await med.mediations();
-    const right = d2.title.startsWith("Translate") ? "refuse" : "accept";
+    const right = truth(d2.missionId);
     await med.mediate(d2.missionId, right, "Matches the acceptance criteria exactly.");
     expect((await med.account()).credits).toBe(1);
     expect(m.troqo.market.stats().honeypotVotes).toBe(2);

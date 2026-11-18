@@ -21,13 +21,36 @@ const policy = (patch: Partial<CertificationPolicy> = {}): CertificationPolicy =
 const expected = (t: TestMarket, missionId: string) =>
   JSON.parse((t.troqo.ctx.db.prepare(`SELECT expected FROM controls WHERE mission_id = ?`).get(missionId) as { expected: string }).expected);
 
+/**
+ * A delivery that passes: the JSON answer, or for code tasks a `solve` that looks the hidden tests up
+ * (good enough to exercise grading end to end, including the isolated runner).
+ */
+const rightAnswer = (exp: unknown): string => {
+  const tests = (exp as { tests?: { args: unknown[]; out: unknown }[] }).tests;
+  if (!tests) return JSON.stringify(exp);
+  return "```js\nfunction solve(...args) {\n  const t = " + JSON.stringify(tests) +
+    ";\n  return t.find((x) => JSON.stringify(x.args) === JSON.stringify(args)).out;\n}\n```";
+};
+
+/** A real mission solved and accepted: that is when hidden controls may follow. */
+async function solveRealMission(t: TestMarket, solver: TroqoClient, kind: string) {
+  const req = await t.agent(20);
+  const real = await req.postMission({ ...SPEC, kind, priceCredits: 4 });
+  await solver.takeMission(real.missionId);
+  await req.sync();
+  await solver.sync();
+  await solver.deliver(real.missionId, { mime: "text/plain", content: "done" });
+  await req.review(real.missionId, "accept");
+  return real.missionId;
+}
+
 async function answerExam(t: TestMarket, a: TroqoClient, kind: string, right: boolean) {
   const exam = await a.takeExam(kind);
   await a.sync(); // receives the generated spec, encrypted like any other
   const local = (await a.mission(exam.missionId)).local;
   expect(local.spec?.spec.length).toBeGreaterThan(20);
   expect(local.specTampered).toBe(false);
-  const content = right ? JSON.stringify(expected(t, exam.missionId)) : "[]";
+  const content = right ? rightAnswer(expected(t, exam.missionId)) : "[]";
   await a.deliver(exam.missionId, { mime: "text/plain", content });
   return (await a.mission(exam.missionId)).status;
 }
@@ -37,14 +60,16 @@ async function certify(t: TestMarket, a: TroqoClient, kind = "data") {
 }
 
 describe("control generators", () => {
-  it("draw a fresh task each time, accept their own answer and reject a wrong one", () => {
+  it("draw a fresh task each time, accept their own answer and reject a wrong one", async () => {
     for (const g of GENERATORS.filter((x) => x.mode === "graded")) {
       for (const d of g.difficulties) {
         const a = g.generate(d);
         const b = g.generate(d);
         expect(a.spec).not.toBe(b.spec);
-        expect(g.grade!(a.expected, "Here you go:\n```json\n" + JSON.stringify(a.expected) + "\n```")).toBe(true);
-        expect(g.grade!(a.expected, JSON.stringify({ wrong: true }))).toBe(false);
+        const right = g.answer ? "Here you go:\n```json\n" + g.answer(a.expected) + "\n```" : rightAnswer(a.expected);
+        expect(await g.grade!(a.expected, right)).toBe(true);
+        expect(await g.grade!(a.expected, JSON.stringify({ wrong: true }))).toBe(false);
+        expect(await g.grade!(a.expected, "function solve() { return null; }")).toBe(false);
       }
     }
     expect(extractJson('Sure! {"a": [1, 2]} done')).toEqual({ a: [1, 2] });
@@ -82,12 +107,33 @@ describe("exams", () => {
   });
 });
 
+describe("code grading", () => {
+  it("runs asynchronously: the server keeps answering while agents' code runs", async () => {
+    m = await market();
+    const a = await m.agent();
+    const exam = await a.takeExam("code");
+    await a.sync();
+    await a.deliver(exam.missionId, { mime: "text/plain", content: "```js\nfunction solve() { while (true) {} }\n```" });
+    const started = Date.now();
+    expect((await fetch(`${m.url}/health`)).status).toBe(200);
+    expect(Date.now() - started).toBeLessThan(500); // a blocking runner would hold this for 4 s
+    expect((await a.mission(exam.missionId)).status).toBe("delivered"); // still grading
+    await m.troqo.certifier.idle();
+    expect((await a.mission(exam.missionId)).status).toBe("refused");
+
+    const next = await a.takeExam("code");
+    await a.sync();
+    await a.deliver(next.missionId, { mime: "text/plain", content: rightAnswer(expected(m, next.missionId)) });
+    await m.troqo.certifier.idle();
+    expect((await a.mission(next.missionId)).status).toBe("accepted");
+  });
+});
+
 describe("hidden controls", () => {
   async function controlFor(t: TestMarket, a: TroqoClient, others: TroqoClient[]) {
-    const req = await t.agent(20);
-    const real = await req.postMission({ ...SPEC, kind: "data", priceCredits: 4 });
-    await a.takeMission(real.missionId); // taking a real mission may queue a control (rate 1 here)
-    const mine = (await a.listMissions()).filter((x) => x.missionId !== real.missionId);
+    expect(await a.listMissions()).toHaveLength(0);
+    await solveRealMission(t, a, "data"); // an accepted mission may queue a control (rate 1 here)
+    const mine = await a.listMissions();
     expect(mine).toHaveLength(1);
     const control = mine[0];
     expect(control.requesterId).toMatch(/^ag_/); // a one-off identity, like any newcomer
@@ -106,11 +152,11 @@ describe("hidden controls", () => {
     const other = await m.agent();
     const control = await controlFor(m, a, [other]);
     const before = (await a.account()).credits;
-    await a.deliver(control.missionId, { mime: "text/plain", content: JSON.stringify(expected(m, control.missionId)) });
+    await a.deliver(control.missionId, { mime: "text/plain", content: rightAnswer(expected(m, control.missionId)) });
     expect((await a.mission(control.missionId)).status).toBe("accepted");
     expect((await a.account()).credits).toBeGreaterThan(before);
     expect((await a.profile()).certifications[0]).toMatchObject({ level: 1, controlsPassed: 1, controlsFailed: 0 });
-    expect(m.troqo.market.stats().missions.accepted ?? 0).toBe(0); // controls stay out of market statistics
+    expect(m.troqo.market.stats().missions.accepted).toBe(1); // only the real mission: controls stay out of statistics
   });
 
   it("contests a failed control like a real requester, checks the mediator and drops the level", async () => {
@@ -143,18 +189,18 @@ describe("model conformity", () => {
     const rankers = [await m.agent(0, { mediator: true }), await m.agent(0, { mediator: true })];
     await rankers[0].declareModel("model-x");
     const solvers = [await m.agent(5), await m.agent(5), await m.agent(5)];
-    const req = await m.agent(50);
     const answers = ["A careful, correct explanation with an example.", "Another good explanation, with an example.", "idk"];
+    const controls: string[] = [];
     for (const [i, s] of solvers.entries()) {
       await s.declareModel("Model-X");
-      const real = await req.postMission({ ...SPEC, kind: "text", priceCredits: 4 });
-      await s.takeMission(real.missionId);
-      const control = (await s.listMissions()).find((x) => x.missionId !== real.missionId)!;
+      await solveRealMission(m, s, "text");
+      const [control] = await s.listMissions();
       await s.takeMission(control.missionId);
       await s.sync();
       expect((await s.mission(control.missionId)).local.spec?.spec).toMatch(/Explain/);
       await s.deliver(control.missionId, { mime: "text/plain", content: answers[i] });
-      expect((await s.mission(control.missionId)).status).toBe("accepted"); // open-ended: paid on delivery
+      expect((await s.mission(control.missionId)).status).toBe("delivered"); // open-ended: paid only once ranked
+      controls.push(control.missionId);
     }
     const specs = m.troqo.ctx.db.prepare(`SELECT DISTINCT spec FROM controls WHERE purpose = 'conformity'`).all();
     expect(specs).toHaveLength(1); // one task for the whole group
@@ -170,6 +216,8 @@ describe("model conformity", () => {
     expect(weak.declaredModel).toBe("model-x");
     expect(weak.conformity).toEqual({ groups: 1, averageScore: 0, status: "below_peers" });
     expect((await solvers[0].profile()).conformity?.status).toBe("consistent");
+    expect((await solvers[0].mission(controls[0])).status).toBe("accepted"); // paid once ranked
+    expect((await solvers[2].mission(controls[2])).status).toBe("refused"); // last for every ranker: not paid
     expect((await rankers[0].account()).credits).toBe(1);
     expect(m.troqo.ctx.db.prepare(`SELECT COUNT(*) AS n FROM controls WHERE delivery IS NOT NULL`).get()).toEqual({ n: 0 });
   });

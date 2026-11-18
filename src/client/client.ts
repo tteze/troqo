@@ -1,4 +1,4 @@
-import { open, seal, sha256, type Identity } from "../shared/crypto.js";
+import { open, seal, sha256, verifyAgentKeys, type Identity, type PublicKeys } from "../shared/crypto.js";
 import { TroqoError } from "../shared/errors.js";
 import {
   canonicalDelivery,
@@ -9,6 +9,8 @@ import {
   type Inbox,
   type MarketRate,
   type MissionInfo,
+  type ModerationVerdict,
+  type PendingModeration,
   type PendingMediation,
   type PendingRanking,
   type RankingBundle,
@@ -170,15 +172,28 @@ export class TroqoClient {
   async deliver(missionId: string, delivery: DeliveryBundle): Promise<MissionInfo> {
     const m = await this.mission(missionId);
     if (!m.local.spec) throw new TroqoError("no_spec", "The spec of this mission has not arrived yet");
-    const keys = await this.api.get<{ boxPublic: string }>(`/v1/agents/${m.requesterId}`);
+    const boxPublic = this.checkedBox(await this.api.get<PublicKeys>(`/v1/agents/${m.requesterId}`), m.requesterId);
     const plain = canonicalDelivery(delivery);
     const info = await this.api.call<MissionInfo>("POST", `/v1/missions/${missionId}/deliver`, {
       deliveryHash: sha256(plain),
       deliveryMime: delivery.mime,
-      envelope: seal(plain, keys.boxPublic),
+      envelope: seal(plain, boxPublic),
     });
     this.store.update(missionId, (l) => (l.delivery = delivery));
     return info;
+  }
+
+  /**
+   * The recipient's encryption key, only if it is provably theirs: the id matches the signing key and
+   * the signing key signed the encryption key. Otherwise nothing is encrypted, so a server handing out
+   * its own key to read content in transit is caught.
+   */
+  private checkedBox(k: Partial<PublicKeys>, expectedId: string): string {
+    const keys = { agentId: expectedId, signPublic: k.signPublic ?? "", boxPublic: k.boxPublic ?? "", boxSignature: k.boxSignature };
+    if (k.agentId !== expectedId || !verifyAgentKeys(keys)) {
+      throw new TroqoError("key_mismatch", `The keys the market gave for ${expectedId} are not signed by that agent: nothing was sent`);
+    }
+    return keys.boxPublic;
   }
 
   // ---------------------------------------------------------------- reads
@@ -208,6 +223,23 @@ export class TroqoClient {
       verdict,
       justification,
     });
+  }
+
+  // ---------------------------------------------------------------- moderation
+
+  /** Reports a mission's public title or summary as illicit or abusive. Locks a small deposit while agents moderate. */
+  report(missionId: string, reason: string) {
+    return this.api.call<{ caseId: string; missionId: string; status: string }>("POST", `/v1/missions/${missionId}/report`, { reason });
+  }
+
+  /** Public texts this agent was drawn to moderate. */
+  async moderations(): Promise<PendingModeration[]> {
+    const inbox = await this.api.call<Inbox>("GET", "/v1/inbox");
+    return inbox.moderations ?? [];
+  }
+
+  moderate(caseId: string, verdict: ModerationVerdict, justification: string) {
+    return this.api.call<{ caseId: string; verdict: ModerationVerdict }>("POST", `/v1/moderations/${caseId}`, { verdict, justification });
   }
 
   // ---------------------------------------------------------------- sync
@@ -264,13 +296,17 @@ export class TroqoClient {
     for (const task of inbox.tasks) {
       const local = this.store.get(task.missionId);
       try {
+        const box = this.checkedBox(
+          { agentId: task.toId, signPublic: task.toSignPublic, boxPublic: task.toBoxPublic, boxSignature: task.toBoxSignature },
+          task.toId,
+        );
         if (task.type === "send_spec") {
           if (!local.spec) {
             report.problems.push(`Spec of mission ${task.missionId} is not on this machine: cannot hand it over`);
             continue;
           }
           await this.api.call("POST", `/v1/missions/${task.missionId}/spec`, {
-            envelope: seal(canonicalSpec(local.spec), task.toBoxPublic),
+            envelope: seal(canonicalSpec(local.spec), box),
           });
           report.specsSent++;
         } else {
@@ -284,7 +320,7 @@ export class TroqoClient {
           }
           await this.api.call("POST", `/v1/missions/${task.missionId}/evidence`, {
             to: task.toId,
-            envelope: seal(plain, task.toBoxPublic),
+            envelope: seal(plain, box),
           });
           report.evidenceSent++;
         }

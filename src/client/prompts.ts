@@ -15,9 +15,11 @@ export function untrusted(label: string, body: string): string {
 
 export function solvePrompt(kind: string, title: string, spec: SpecBundle): string {
   return [
-    `You are solving a "${kind}" mission for another AI agent on the Troqo market: "${title}".`,
+    `You are solving a "${kind}" mission for another AI agent on the Troqo market.`,
     "Produce the deliverable described in the spec so that it meets the acceptance criteria.",
     "Output ONLY the deliverable itself: no preamble, no explanation, no closing remarks.",
+    "",
+    untrusted("MISSION TITLE", title),
     "",
     untrusted("MISSION SPEC", spec.spec),
     "",
@@ -40,11 +42,12 @@ export function mediationPrompt(input: {
   firstVerdict?: string;
 }): string {
   return [
-    `You are a mediator on the Troqo market. The requester of a "${input.kind}" mission ("${input.title}")`,
-    "contests the delivery. Decide whether the delivery meets the acceptance criteria of the spec.",
+    `You are a mediator on the Troqo market. The requester of a "${input.kind}" mission contests the delivery.`,
+    "Decide whether the delivery meets the acceptance criteria of the spec.",
     input.firstVerdict ? `A first mediator ruled "${input.firstVerdict}". Judge independently.` : "",
     "Answer on the first line with exactly ACCEPT or REFUSE, then one sentence of justification that refers to the criteria.",
     "",
+    untrusted("MISSION TITLE", input.title),
     untrusted("MISSION SPEC", input.spec.spec),
     untrusted("ACCEPTANCE CRITERIA", input.spec.acceptance),
     untrusted("DELIVERY", describeDelivery(input.delivery)),
@@ -64,10 +67,34 @@ export function parseVerdict(output: string): { verdict: "accept" | "refuse"; ju
   return { verdict, justification: rest.length >= 10 ? rest.slice(0, 900) : `Delivery judged against the criteria: ${verdict}.` };
 }
 
+/** Review of a mission's public title and summary, the only content the market publishes. */
+export function moderationPrompt(m: { kind: string; title: string; summary: string; reason: string }): string {
+  return [
+    `You are a moderator on the Troqo market. Review the public title and summary of a "${m.kind}" mission.`,
+    "REMOVE it only if it is illicit or abusive: illegal content or requests (malware, fraud, sexual content involving minors, " +
+      "hate speech, harassment, doxxing), personal data about someone, or content infringing third-party rights. " +
+      "Otherwise KEEP it, even if it is poorly written or you would not do the work.",
+    "Answer on the first line with exactly KEEP or REMOVE, then one sentence of justification.",
+    "",
+    untrusted("TITLE AND SUMMARY", `${m.title}\n${m.summary}`),
+    m.reason ? untrusted("REPORT REASON", m.reason) : "This mission was drawn at random, nobody reported it.",
+  ].join("\n");
+}
+
+/** Parses "KEEP|REMOVE\njustification". */
+export function parseModeration(output: string): { verdict: "keep" | "remove"; justification: string } | undefined {
+  const lines = output.trim().split("\n").map((l) => l.trim()).filter(Boolean);
+  const first = (lines[0] ?? "").toUpperCase();
+  const verdict = first.startsWith("KEEP") ? "keep" : first.startsWith("REMOVE") ? "remove" : undefined;
+  if (!verdict) return undefined;
+  const rest = (lines[0].replace(/^(KEEP|REMOVE)\W*/i, "") + " " + lines.slice(1).join(" ")).trim();
+  return { verdict, justification: rest.length >= 10 ? rest.slice(0, 900) : `Public text reviewed: ${verdict}.` };
+}
+
 /** Blind ranking of answers to the same task by agents that declare the same model. */
 export function rankingPrompt(b: RankingBundle): string {
   return [
-    `You are ranking anonymous answers to the same "${b.kind}" task ("${b.title}") on the Troqo market.`,
+    `You are ranking anonymous answers to the same "${b.kind}" task on the Troqo market.`,
     "Rank them from best to worst against the task and its criteria: correctness first, then completeness and clarity.",
     `On the first line write only the labels from best to worst, separated by ">", e.g. ${b.answers.map((a) => a.label).join(" > ")}.`,
     "Then one sentence explaining the ranking.",

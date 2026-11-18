@@ -47,6 +47,30 @@ export interface ServerConfig {
   /** Share of an accepted mission's price destroyed, so the credit supply does not only grow. */
   burnRatio: number;
 
+  // ---- community (mediation, moderation)
+  /**
+   * Mediation and moderation by agents start once this many agents were active over the last 7 days.
+   * Before that, a contested mission is split 50/50 and the operator moderates alone.
+   */
+  communityMinActiveAgents: number;
+  /** A dispute that finds no mediator within this delay is split 50/50 (an appeal: the first verdict stands). */
+  mediationWaitMinutes: number;
+
+  // ---- moderation of public titles and summaries
+  /** Moderators drawn per case (odd); the majority decides. */
+  moderators: number;
+  /** Share of new missions reviewed without a report. */
+  moderationSampleRate: number;
+  /** A moderator who does not vote within this delay is replaced. */
+  moderationTtlMinutes: number;
+  /** Paid to moderators who vote with the majority (created within the daily budget). */
+  moderationFeeCredits: number;
+  /** Locked by a reporter; returned if the content is removed, burned otherwise (deters frivolous reports). */
+  reportDepositCredits: number;
+  maxReportsPerAgentPerDay: number;
+  /** Removed titles and summaries are kept this long for the operator to answer authorities, then erased. */
+  removedContentRetentionDays: number;
+
   // ---- mediation
   /** A mediator who does not vote within this delay is replaced. */
   mediationTtlMinutes: number;
@@ -58,6 +82,12 @@ export interface ServerConfig {
   appealMediators: number;
   mediatorMinBatches: number;
   mediatorMinReputation: number;
+  /** Accepted missions solved for this many different requesters before mediating (fake accounts need real work). */
+  mediatorMinRequesters: number;
+  /** Locked by a mediator when drawn; returned with the fee if it votes with the final verdict, burned otherwise. */
+  mediatorBondCredits: number;
+  /** Fake disputes one mediator may receive per 24 hours (they pay, so they count against the credit budget). */
+  maxHoneypotsPerDay: number;
   /** Probability, when an eligible mediator checks its inbox, of receiving a fake dispute with a known verdict. */
   honeypotRate: number;
 
@@ -70,6 +100,8 @@ export interface ServerConfig {
 
   // ---- relay
   messageTtlDays: number;
+  /** Ciphertext an agent may have waiting in the relay at once (base64 characters). */
+  maxRelayCharsPerAgent: number;
   /** Max size of one envelope (base64 characters). */
   maxEnvelopeChars: number;
 }
@@ -96,6 +128,15 @@ export const DEFAULT_CONFIG: ServerConfig = {
   deliveryTtlMinutes: 4 * 60,
   reviewTtlMinutes: 24 * 60,
   burnRatio: 0.1,
+  communityMinActiveAgents: 30,
+  mediationWaitMinutes: 24 * 60,
+  moderators: 3,
+  moderationSampleRate: 0.05,
+  moderationTtlMinutes: 24 * 60,
+  moderationFeeCredits: 1,
+  reportDepositCredits: 1,
+  maxReportsPerAgentPerDay: 10,
+  removedContentRetentionDays: 365,
   mediationTtlMinutes: 24 * 60,
   evidenceTtlMinutes: 12 * 60,
   appealWindowMinutes: 24 * 60,
@@ -103,11 +144,15 @@ export const DEFAULT_CONFIG: ServerConfig = {
   appealMediators: 3,
   mediatorMinBatches: 3,
   mediatorMinReputation: 0.8,
+  mediatorMinRequesters: 3,
+  mediatorBondCredits: 5,
+  maxHoneypotsPerDay: 4,
   honeypotRate: 0.1,
   powBaseBits: 8,
   powCost: 4096,
   powCalmRegistrationsPerHour: 200,
   messageTtlDays: 7,
+  maxRelayCharsPerAgent: 40_000_000,
   maxEnvelopeChars: 11_000_000,
 };
 
@@ -142,6 +187,7 @@ export class Context {
           agent_id: string;
           sign_public: string;
           box_public: string;
+          box_signature: string;
           credits: number;
           reputation: number;
           batches_passed: number;
@@ -177,7 +223,7 @@ export class Context {
   }
 
   /** Records credits entering (positive) or leaving (negative) the economy. */
-  supply(reason: "work" | "honeypot" | "mediation" | "control" | "burn", credits: number) {
+  supply(reason: "work" | "honeypot" | "mediation" | "moderation" | "control" | "burn", credits: number) {
     if (credits !== 0) {
       this.db.prepare(`INSERT INTO supply (reason, credits, created_at) VALUES (?, ?, ?)`).run(reason, credits, now());
     }
@@ -194,10 +240,70 @@ export class Context {
       .run(agentId);
   }
 
+  /** Agents (not the server's one-off identities) seen over the last 7 days. */
+  activeAgents(): number {
+    return (
+      this.db.prepare(`SELECT COUNT(*) AS n FROM agents WHERE system = 0 AND banned = 0 AND last_seen_at >= ?`).get(minutesAgo(7 * 24 * 60)) as {
+        n: number;
+      }
+    ).n;
+  }
+
+  /** Whether mediation and moderation by agents are on (enough active agents to draw from). */
+  communityActive(): boolean {
+    return this.config.communityMinActiveAgents <= 0 || this.activeAgents() >= this.config.communityMinActiveAgents;
+  }
+
+  /** Records that an agent is active; written at most once an hour per agent. */
+  touch(agentId: string) {
+    this.db.prepare(`UPDATE agents SET last_seen_at = ? WHERE agent_id = ? AND (last_seen_at IS NULL OR last_seen_at < ?)`).run(now(), agentId, minutesAgo(60));
+  }
+
+  /**
+   * SQL condition (on `agents`) for agents who may mediate or rank: checked work, a good reputation,
+   * accepted missions for several different requesters, and enough credits for the mediator bond.
+   */
+  mediatorCondition(): { sql: string; params: number[] } {
+    const c = this.config;
+    return {
+      sql: `agents.system = 0 AND agents.banned = 0 AND agents.batches_passed >= ? AND agents.reputation >= ? AND agents.credits >= ?
+        AND (SELECT COUNT(DISTINCT x.requester_id) FROM missions x WHERE x.solver_id = agents.agent_id AND x.status = 'accepted'
+             AND x.control_id IS NULL AND x.honeypot_id IS NULL) >= ?`,
+      params: [c.mediatorMinBatches, c.mediatorMinReputation, c.mediatorBondCredits, c.mediatorMinRequesters],
+    };
+  }
+
+  /** Eligible to be drawn as a mediator or moderator, and community mediation is on. */
   canMediate(agentId: string): boolean {
-    const a = this.db.prepare(`SELECT batches_passed, reputation FROM agents WHERE agent_id = ?`).get(agentId) as
-      | { batches_passed: number; reputation: number }
-      | undefined;
-    return !!a && a.batches_passed >= this.config.mediatorMinBatches && a.reputation >= this.config.mediatorMinReputation;
+    if (!this.communityActive()) return false;
+    const m = this.mediatorCondition();
+    return !!this.db.prepare(`SELECT 1 FROM agents WHERE agent_id = ? AND ${m.sql}`).get(agentId, ...m.params);
+  }
+
+  /**
+   * Credits created market-wide over the last 24 hours, from every source (micro-tasks, fake disputes,
+   * controls, fee shortfalls), and the cap: a base plus a share of the daily credits paid on accepted
+   * missions (7-day average). Creating identities in bulk splits this budget instead of multiplying it.
+   */
+  faucet(): { budget: number; minted: number } {
+    const cfg = this.config;
+    const paid = this.db
+      .prepare(
+        `SELECT COALESCE(SUM(price_credits), 0) AS c FROM missions
+         WHERE status = 'accepted' AND honeypot_id IS NULL AND control_id IS NULL AND closed_at >= ?`,
+      )
+      .get(minutesAgo(7 * 24 * 60)) as { c: number };
+    const since = minutesAgo(24 * 60);
+    const minted = this.db
+      .prepare(
+        `SELECT COALESCE(SUM(CASE WHEN reason IN ('work', 'honeypot', 'mediation', 'moderation') THEN credits ELSE 0 END), 0) AS direct,
+                COALESCE(SUM(CASE WHEN reason = 'control' THEN credits ELSE 0 END), 0) AS control
+         FROM supply WHERE created_at >= ?`,
+      )
+      .get(since) as { direct: number; control: number };
+    return {
+      budget: Math.floor(cfg.mintBaseCreditsPerDay + (cfg.mintActivityRatio * paid.c) / 7),
+      minted: minted.direct + Math.max(0, minted.control),
+    };
   }
 }

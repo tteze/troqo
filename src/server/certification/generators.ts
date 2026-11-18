@@ -1,4 +1,5 @@
 import { randomInt } from "node:crypto";
+import { extractCode, runCode, type CodeTest } from "./code-runner.js";
 
 /**
  * Generators of control missions. Each call draws fresh random parameters, so a control is never
@@ -27,7 +28,11 @@ export interface Generator {
   difficulties: number[];
   generate(difficulty: number): GeneratedTask;
   /** For graded generators: does the delivered content meet the expected answer? */
-  grade?(expected: unknown, content: string): boolean;
+  grade?(expected: unknown, content: string): boolean | Promise<boolean>;
+  /** Grading runs the delivered code (asynchronously, in a queued child process). */
+  runsCode?: boolean;
+  /** For generators whose expected value is the answer itself: the answer as a delivery (used for fake disputes). */
+  answer?(expected: unknown): string;
 }
 
 // ------------------------------------------------------------------ helpers
@@ -83,6 +88,28 @@ export function sameJson(a: unknown, b: unknown): boolean {
 }
 
 const gradeJson = (expected: unknown, content: string) => sameJson(extractJson(content), expected);
+const answerJson = (expected: unknown) => JSON.stringify(expected);
+
+/** A plausible but wrong version of an answer: one value changed, one item dropped or two swapped. */
+export function corruptAnswer(expected: unknown): unknown {
+  const v = structuredClone(expected) as unknown;
+  if (Array.isArray(v)) {
+    if (v.length === 0) return ["?"];
+    const i = randomInt(v.length);
+    if (typeof v[i] === "number") v[i] = (v[i] as number) + between(1, 9);
+    else if (v.length > 1) [v[0], v[v.length - 1]] = [v[v.length - 1], v[0]];
+    else v.pop();
+    return sameJson(v, expected) ? [...v, v[0]] : v;
+  }
+  if (v && typeof v === "object") {
+    const o = v as Record<string, unknown>;
+    const keys = Object.keys(o);
+    const k = keys[randomInt(keys.length)];
+    o[k] = typeof o[k] === "number" ? (o[k] as number) + between(1, 9) : typeof o[k] === "string" ? `${o[k]}0` : null;
+    return o;
+  }
+  return typeof v === "number" ? v + 1 : `${String(v)}0`;
+}
 const ONLY_JSON = "Answer with the JSON value only.";
 
 // ------------------------------------------------------------------ graded: data
@@ -112,6 +139,7 @@ const cityTotals: Generator = {
     };
   },
   grade: gradeJson,
+  answer: answerJson,
 };
 
 const filterPeople: Generator = {
@@ -146,6 +174,7 @@ const filterPeople: Generator = {
     };
   },
   grade: gradeJson,
+  answer: answerJson,
 };
 
 // ------------------------------------------------------------------ graded: text
@@ -182,6 +211,7 @@ const invoiceFields: Generator = {
     };
   },
   grade: gradeJson,
+  answer: answerJson,
 };
 
 const isoDates: Generator = {
@@ -213,53 +243,137 @@ const isoDates: Generator = {
     };
   },
   grade: gradeJson,
+  answer: answerJson,
 };
 
 // ------------------------------------------------------------------ graded: code
 
-const traceFunction: Generator = {
-  id: "code.trace",
+/**
+ * Code generators ask for a plain JavaScript function `solve`, with random parameters, and grade it
+ * on hidden tests computed by a reference implementation. The code runs isolated (see code-runner.ts).
+ */
+const CODE_RULES =
+  "Write it in plain JavaScript (no TypeScript types, no imports, no I/O): a function named `solve`. " +
+  "Answer with the code only.";
+
+const gradeCode = async (expected: unknown, content: string) => {
+  const tests = (expected as { tests: CodeTest[] }).tests;
+  const out = await runCode(extractCode(content), tests.map((t) => t.args));
+  return out.every((o, i) => o !== null && sameJson(JSON.parse(o), tests[i].out));
+};
+
+const WORDS = ["Hello, World!", "Troqo 2026", "Zebra & yak", "abc xyz", "Mixed CASE text.", "", "édition 9", "a-b_c"];
+
+const caesar: Generator = {
+  id: "code.caesar",
   kind: "code",
   mode: "graded",
   difficulties: [1, 2],
   generate(difficulty) {
-    const a = between(2, 9);
-    const b = between(1, 20);
-    const c = between(7, 31);
-    const t = between(10, 60);
-    const inputs = sample(Array.from({ length: 90 }, (_, i) => i + 1), 4);
-    let source: string;
-    let fn: (x: number) => number;
-    if (difficulty === 1) {
-      source = `function f(x) {\n  const y = (x * ${a} + ${b}) % ${c};\n  return y > ${Math.floor(c / 2)} ? y - x : y + x;\n}`;
-      fn = (x) => {
-        const y = (x * a + b) % c;
-        return y > Math.floor(c / 2) ? y - x : y + x;
-      };
-    } else {
-      source =
-        `function f(x) {\n  let acc = ${b};\n  for (let i = 1; i <= x % ${c} + 3; i++) {\n` +
-        `    if ((acc + i) % ${a} === 0) acc = Math.floor(acc / 2) + i;\n    else acc += i * ${a};\n` +
-        `    if (acc > ${t * 10}) acc -= ${t};\n  }\n  return acc;\n}`;
-      fn = (x) => {
-        let acc = b;
-        for (let i = 1; i <= (x % c) + 3; i++) {
-          if ((acc + i) % a === 0) acc = Math.floor(acc / 2) + i;
-          else acc += i * a;
-          if (acc > t * 10) acc -= t;
-        }
-        return acc;
-      };
-    }
+    const k = between(1, 25) * (difficulty === 2 && randomInt(2) ? -1 : 1);
+    const d = between(1, 9);
+    const ref = (s: string) =>
+      s.replace(/[a-zA-Z0-9]/g, (ch) => {
+        if (/[0-9]/.test(ch)) return difficulty === 2 ? String((Number(ch) + d) % 10) : ch;
+        const base = ch <= "Z" ? 65 : 97;
+        return String.fromCharCode(((((ch.charCodeAt(0) - base + k) % 26) + 26) % 26) + base);
+      });
+    const inputs = [...sample(WORDS, 5), `${pick(NAMES)} ${between(10, 99)}`];
+    const rule =
+      `shifts every ASCII letter by ${k} positions in the alphabet (wrapping around, keeping its case)` +
+      (difficulty === 2 ? `, adds ${d} to every digit modulo 10,` : ", leaves digits unchanged,") +
+      " and leaves every other character unchanged";
     return {
-      title: "Predict the output of a JavaScript function",
-      summary: "Read a short JavaScript function and give its return value for four inputs.",
-      spec: `\`\`\`js\n${source}\n\`\`\`\n\nReturn a JSON array of [f(${inputs.join("), f(")})]. ${ONLY_JSON}`,
-      acceptance: "The four values are exactly what the function returns, in the order asked.",
-      expected: inputs.map(fn),
+      title: "Implement a Caesar-style text shift",
+      summary: "A small JavaScript function that shifts letters by a fixed amount, with exact rules for case and other characters.",
+      spec: `Write solve(text) that ${rule}. Example: solve(${JSON.stringify(inputs[inputs.length - 1])}) returns ${JSON.stringify(ref(inputs[inputs.length - 1]))}. ${CODE_RULES}`,
+      acceptance: "solve returns exactly the transformed string for any input, including empty strings and non-letters.",
+      expected: { tests: inputs.map((x) => ({ args: [x], out: ref(x) })) },
     };
   },
-  grade: gradeJson,
+  grade: gradeCode,
+  runsCode: true,
+};
+
+const scoreboard: Generator = {
+  id: "code.scoreboard",
+  kind: "code",
+  mode: "graded",
+  difficulties: [1, 2],
+  generate(difficulty) {
+    const threshold = between(20, 60);
+    const ref = (lines: string[]) => {
+      const totals = new Map<string, number>();
+      for (const line of lines) {
+        const m = line.match(/^\s*([A-Za-zÀ-ÿ]+)\s*:\s*(-?\d+)\s*$/);
+        if (!m) continue;
+        totals.set(m[1], (difficulty === 2 ? (totals.get(m[1]) ?? 0) : 0) + Number(m[2]));
+      }
+      return [...totals]
+        .filter(([, v]) => v >= threshold)
+        .sort((a, b) => b[1] - a[1] || (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0))
+        .map(([n]) => n);
+    };
+    const makeLines = () => {
+      const names = sample(NAMES, between(3, 6));
+      const lines = names.map((n) => `${n}:${between(0, 80)}`);
+      if (difficulty === 2) lines.push(`${pick(names)} : ${between(-10, 40)}`, "broken line", `${pick(names)}:x`, `  ${pick(names)}:${between(0, 30)}  `);
+      return lines;
+    };
+    const inputs = [makeLines(), makeLines(), makeLines(), [], makeLines()];
+    const rule =
+      difficulty === 1
+        ? `Each line is "name:score" with a unique name. Return the names whose score is at least ${threshold}`
+        : `Lines look like "name:score", possibly with spaces around the colon or the line; a name may appear on several lines and its scores add up; ignore lines that do not match. Return the names whose total is at least ${threshold}`;
+    return {
+      title: "Implement a scoreboard filter",
+      summary: "A JavaScript function that parses name:score lines and returns the qualifying names in order.",
+      spec:
+        `Write solve(lines), where lines is an array of strings. ${rule}, sorted by score from highest to lowest, ` +
+        `then alphabetically (plain < comparison) for equal scores. ${CODE_RULES}`,
+      acceptance: "solve returns exactly the qualifying names in the required order for any input, including an empty array.",
+      expected: { tests: inputs.map((x) => ({ args: [x], out: ref(x) })) },
+    };
+  },
+  grade: gradeCode,
+  runsCode: true,
+};
+
+const chunkSums: Generator = {
+  id: "code.chunk-sums",
+  kind: "code",
+  mode: "graded",
+  difficulties: [1, 2],
+  generate(difficulty) {
+    const size = between(2, 4);
+    const mod = between(2, 5);
+    const ref = (arr: number[]) => {
+      const out: number[] = [];
+      for (let i = 0; i < arr.length; i += size) {
+        const chunk = arr.slice(i, i + size);
+        if (difficulty === 2 && chunk.length < size) continue;
+        const sum = chunk.reduce((a, b) => a + b, 0);
+        if (sum % mod === 0) out.push(sum);
+      }
+      return out;
+    };
+    const arr = () => Array.from({ length: between(0, 13) }, () => between(difficulty === 2 ? -20 : 0, 30));
+    const inputs = [arr(), arr(), arr(), [], arr(), arr()];
+    return {
+      title: "Implement chunked sums",
+      summary: "A JavaScript function that splits an array into fixed-size chunks and keeps some of their sums.",
+      spec:
+        `Write solve(numbers): split the array of integers into consecutive chunks of ${size} ` +
+        (difficulty === 2 ? "(drop a last chunk shorter than that), " : "(the last chunk may be shorter), ") +
+        `and return, in order, the sums of the chunks whose sum is divisible by ${mod}` +
+        (difficulty === 2 ? " (negative sums included; 0 counts as divisible)" : "") +
+        `. ${CODE_RULES}`,
+      acceptance: "solve returns exactly the right sums in order for any input, including an empty array.",
+      expected: { tests: inputs.map((x) => ({ args: [x], out: ref(x) })) },
+    };
+  },
+  grade: gradeCode,
+  runsCode: true,
 };
 
 // ------------------------------------------------------------------ open-ended (conformity)
@@ -313,7 +427,7 @@ const writeFunction: Generator = {
   },
 };
 
-export const GENERATORS: Generator[] = [cityTotals, filterPeople, invoiceFields, isoDates, traceFunction, explain, writeFunction];
+export const GENERATORS: Generator[] = [cityTotals, filterPeople, invoiceFields, isoDates, caesar, scoreboard, chunkSums, explain, writeFunction];
 
 export function generatorById(id: string): Generator | undefined {
   return GENERATORS.find((g) => g.id === id);

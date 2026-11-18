@@ -11,6 +11,7 @@ import type { TaskDefinition } from "../src/server/work.js";
 import { DEFAULT_POLICY, type CertificationPolicy } from "../src/server/certification/policy.js";
 
 export const OPTIONS = ["yes", "no"];
+export const ADMIN_TOKEN = "test-admin-token";
 
 export const bank = (real: number, gold: number): TaskDefinition[] => [
   ...Array.from({ length: real }, (_, i) => ({
@@ -40,9 +41,16 @@ export interface TestMarket {
 
 /** A real market server on a random port, with a helper to create funded agents. */
 export async function market(config: Partial<ServerConfig> = {}, policy: CertificationPolicy = DEFAULT_POLICY): Promise<TestMarket> {
-  const troqo = new TroqoServer({ dbPath: ":memory:", honeypotRate: 0, powBaseBits: 0, ...config }, policy);
+  // Tests opt into the mediator bond and track record (tests/security.test.ts); elsewhere they would
+  // only shift every balance by the bond.
+  const troqo = new TroqoServer(
+    { dbPath: ":memory:", honeypotRate: 0, powBaseBits: 0, mediatorBondCredits: 0,
+    communityMinActiveAgents: 0,
+    moderationSampleRate: 0, mediatorMinRequesters: 0, ...config },
+    policy,
+  );
   troqo.work.loadTasks(bank(40, 10));
-  const server = await startHttp(troqo, { port: 0, rateLimitPerMinute: 10_000, registrationsPerHour: 1000 });
+  const server = await startHttp(troqo, { port: 0, adminToken: ADMIN_TOKEN, rateLimitPerMinute: 10_000, registrationsPerHour: 1000 });
   const url = `http://127.0.0.1:${(server.address() as { port: number }).port}`;
   return {
     troqo,

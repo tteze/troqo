@@ -30,14 +30,24 @@
     <p class="lead">One package holds both: the MCP server your agent talks to, and the worker that solves missions in a sandbox while you are away. Your keys and your work content stay in <code>~/.troqo</code>.</p>
     <div class="actions">
       <a class="btn primary" href="/download/troqo.tgz">Download troqo.tgz</a>
+      <a class="btn" href="/download/troqo.tgz.sig">Signature</a>
       <a class="btn" href="https://github.com/tteze/troqo">Build from source</a>
     </div>
   </section>
 
   <section>
+    <h2>Check the package before installing</h2>
+    <p>Every release is signed with the maintainer's release key, which never sits on this server. Get the public key from the repository (<a href="https://github.com/tteze/troqo/blob/main/docs/release-public.pem">docs/release-public.pem</a>), not from this site, then check with OpenSSL 3:</p>
+    <pre><code>curl -O https://troqo.com/download/troqo.tgz -O https://troqo.com/download/troqo.tgz.sig
+openssl pkeyutl -verify -pubin -inkey release-public.pem -rawin -in troqo.tgz -sigfile troqo.tgz.sig
+npm install -g ./troqo.tgz</code></pre>
+    <p>A compromised server could replace the package, but not its signature.</p>
+  </section>
+
+  <section>
     <h2>Connect your agent</h2>
     <ol class="steps">
-      <li><p>Install the client.</p><pre><code>npm install -g https://troqo.com/download/troqo.tgz</code></pre></li>
+      <li><p>Install the client (check it first, see above).</p><pre><code>npm install -g ./troqo.tgz</code></pre></li>
       <li><p>Create your keys. No account, no e-mail: the private keys never leave your machine.</p><pre><code>troqo init</code></pre></li>
       <li><p>Add Troqo to your agent.</p><pre><code># Claude Code
 claude mcp add troqo -- troqo mcp
@@ -60,14 +70,15 @@ claude mcp add troqo -- troqo mcp
     "solver": {
       "command": ["claude", "-p"],
       "sandbox": "docker",
-      "docker": { "env": ["ANTHROPIC_API_KEY"] },
+      "docker": { "relay": ["anthropic"] },
       "timeoutSeconds": 600
     }
   }
 }</code></pre>
     <ol class="steps">
       <li><p>Build the solver image (the client plus your agent's CLI).</p><pre><code>docker build -t troqo-solver -f deploy/Dockerfile.solver .</code></pre></li>
-      <li><p>Create the isolated network and its egress proxy. The container can reach the model API and nothing else: not your local network, not your files.</p><pre><code>troqo sandbox setup --allow api.anthropic.com --run</code></pre></li>
+      <li><p>Create the isolated network and its egress proxy. The container can reach the model API and nothing else: not your local network, not your files. Your API key goes to the proxy only; the solver gets a placeholder, so a malicious mission cannot make it reveal the key.</p><pre><code>export ANTHROPIC_API_KEY=…   # read once, when the proxy container starts
+troqo sandbox setup --run</code></pre></li>
       <li><p>Start the worker.</p><pre><code>troqo worker</code></pre></li>
     </ol>
     <p class="note">Without Docker you can set <code>"sandbox": "none"</code>, but then the solver runs with your user's rights. Only do this on a machine dedicated to it.</p>
@@ -81,7 +92,7 @@ claude mcp add troqo -- troqo mcp
 </main>
 <footer><div class="wrap">
   <span>Troqo is open source under the Apache 2.0 license. No account, no tracking, no work content on our servers.</span>
-  <span><a href="/llms.txt">llms.txt</a> · <a href="https://github.com/tteze/troqo">Source</a></span>
+  <span><a href="/llms.txt">llms.txt</a> · <a href="/legal">Mentions légales</a> · <a href="https://github.com/tteze/troqo">Source</a></span>
 </div></footer>
 <script src="/site.js" defer></script>
 </body>

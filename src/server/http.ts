@@ -6,6 +6,7 @@ import { fileURLToPath } from "node:url";
 import { agentIdFor, HEADERS, requestSigningString, verifyMessage } from "../shared/crypto.js";
 import { TroqoError } from "../shared/errors.js";
 import type { TroqoServer } from "./troqo.js";
+import type { PowChallenge } from "../shared/pow.js";
 
 export interface HttpOptions {
   port: number;
@@ -57,6 +58,8 @@ function statusFor(code: string): number {
   if (code.startsWith("unknown_")) return 404;
   if (code === "faucet_dry") return 429;
   if (code === "certification_required") return 403;
+  if (code === "too_many_reports") return 429;
+  if (code === "already_reported" || code === "already_removed" || code === "appeal_unavailable") return 409;
   if (code === "mission_not_open" || code === "key_conflict" || code === "invalid_state" || code === "batch_closed") return 409;
   return 400;
 }
@@ -65,12 +68,13 @@ function send(res: ServerResponse, status: number, body: unknown, headers: Recor
   res.writeHead(status, { "content-type": "application/json", "cache-control": "no-store", ...headers }).end(JSON.stringify(body));
 }
 
-async function readBody(req: IncomingMessage): Promise<string> {
+async function readBody(req: IncomingMessage, max = MAX_BODY): Promise<string> {
+  if (Number(req.headers["content-length"] ?? 0) > max) throw new HttpError(413, "body_too_large", "Request body too large");
   const chunks: Buffer[] = [];
   let size = 0;
   for await (const c of req) {
     size += (c as Buffer).length;
-    if (size > MAX_BODY) throw new HttpError(413, "body_too_large", "Request body too large");
+    if (size > max) throw new HttpError(413, "body_too_large", "Request body too large");
     chunks.push(c as Buffer);
   }
   return Buffer.concat(chunks).toString("utf8");
@@ -82,19 +86,33 @@ function safeEqual(a: string, b: string) {
   return x.length === y.length && timingSafeEqual(x, y);
 }
 
-/** Fixed-window counters per key. Good enough for one process. */
-class Limiter {
+/**
+ * Fixed-window counters per key (client addresses). Good enough for one process. Expired entries are
+ * purged every few minutes, so an address is kept in memory no longer than its window plus 5 minutes,
+ * and never written anywhere.
+ */
+export class Limiter {
   private readonly hits = new Map<string, { n: number; until: number }>();
+  private nextPurge = 0;
   constructor(
     private readonly max: number,
     private readonly windowMs: number,
   ) {}
+  /** Hits in the current window, without counting a new one. */
+  count(key: string): number {
+    const h = this.hits.get(key);
+    return h && h.until >= Date.now() ? h.n : 0;
+  }
+
   allow(key: string): boolean {
     const t = Date.now();
+    if (t >= this.nextPurge || this.hits.size > 50_000) {
+      for (const [k, v] of this.hits) if (v.until < t) this.hits.delete(k);
+      this.nextPurge = t + 5 * 60_000;
+    }
     const h = this.hits.get(key);
     if (!h || h.until < t) {
       this.hits.set(key, { n: 1, until: t + this.windowMs });
-      if (this.hits.size > 50_000) for (const [k, v] of this.hits) if (v.until < t) this.hits.delete(k);
       return true;
     }
     h.n++;
@@ -109,6 +127,15 @@ export function startHttp(troqo: TroqoServer, opts: HttpOptions): Promise<Server
   const docsFile = opts.docsFile ?? join(ROOT, "docs", "API.md");
   const limiter = new Limiter(opts.rateLimitPerMinute ?? 300, 60_000);
   const registrations = new Limiter(opts.registrationsPerHour ?? 20, 3_600_000);
+  // New identities per hour and per network (/24, /48), to raise the proof of work only where a surge comes from.
+  const networkRegistrations = new Limiter(Number.MAX_SAFE_INTEGER, 3_600_000);
+  const powFor = (ip: string): PowChallenge => {
+    const base = troqo.powChallenge();
+    if (base.bits <= 0) return base;
+    const n = networkRegistrations.count(networkKey(ip));
+    const extra = n > 3 ? Math.floor(Math.log2(n / 3)) + 1 : 0;
+    return { ...base, bits: Math.min(base.bits + extra, 24) };
+  };
   const nonces = new Map<string, number>();
   const { work, market } = troqo;
 
@@ -149,6 +176,12 @@ export function startHttp(troqo: TroqoServer, opts: HttpOptions): Promise<Server
     ["POST", /^\/v1\/missions\/([\w-]+)\/mediate$/, ({ agentId, params, body }) =>
       market.mediate(agentId, params[0], oneOf(body.verdict, ["accept", "refuse"]), str(body.justification))],
     ["GET", /^\/v1\/inbox$/, ({ agentId }) => market.inbox(agentId)],
+    ["POST", /^\/v1\/missions\/([\w-]+)\/report$/, ({ agentId, params, body }) => {
+      const k = troqo.moderation.report(agentId, params[0], str(body.reason));
+      return { caseId: k.caseId, missionId: k.missionId, status: k.status };
+    }],
+    ["POST", /^\/v1\/moderations\/([\w-]+)$/, ({ agentId, params, body }) =>
+      troqo.moderation.vote(agentId, params[0], oneOf(body.verdict, ["keep", "remove"]), str(body.justification))],
     ["POST", /^\/v1\/profile$/, ({ agentId, body }) => troqo.certifier.setModel(agentId, str(body.model))],
     ["POST", /^\/v1\/certifications\/([\w-]+)\/exam$/, ({ agentId, params }) => troqo.certifier.startExam(agentId, params[0])],
     ["POST", /^\/v1\/rankings\/([\w-]+)$/, ({ agentId, params, body }) =>
@@ -156,7 +189,8 @@ export function startHttp(troqo: TroqoServer, opts: HttpOptions): Promise<Server
     ["POST", /^\/v1\/inbox\/([\w-]+)\/ack$/, ({ agentId, params }) => (market.ack(agentId, params[0]), { ok: true })],
   ];
 
-  function authenticate(req: IncomingMessage, path: string, body: string): string {
+  /** Header checks that need no body: done before reading it, so unsigned junk costs the server nothing. */
+  function preAuthenticate(req: IncomingMessage, path: string) {
     const h = (name: string) => {
       const v = req.headers[name];
       return typeof v === "string" ? v : undefined;
@@ -171,22 +205,37 @@ export function startHttp(troqo: TroqoServer, opts: HttpOptions): Promise<Server
     const skew = Math.abs(Date.now() - Date.parse(timestamp));
     if (!(skew <= CLOCK_SKEW_MS)) throw new HttpError(401, "bad_timestamp", "Timestamp missing or more than 5 minutes off");
     if (!/^[\w-]{8,64}$/.test(nonce)) throw new HttpError(401, "bad_nonce", "Invalid nonce");
+    if (nonces.has(`${agentId}:${nonce}`)) throw new HttpError(401, "replayed", "This request was already received");
+    if (path !== "/v1/register") {
+      const a = troqo.ctx.db.prepare(`SELECT banned FROM agents WHERE agent_id = ?`).get(agentId) as { banned: number } | undefined;
+      if (!a) throw new HttpError(401, "unknown_agent", "Register your public keys first");
+      if (a.banned) throw new HttpError(403, "banned", "This identity was banned by the operator (see troqo.com/legal)");
+    }
+    return { agentId, timestamp, nonce, signature };
+  }
+
+  function authenticate(req: IncomingMessage, path: string, body: string): string {
+    const { agentId, timestamp, nonce, signature } = preAuthenticate(req, path);
     const key = `${agentId}:${nonce}`;
-    if (nonces.has(key)) throw new HttpError(401, "replayed", "This request was already received");
 
     let signPublic: string;
     if (path === "/v1/register") {
       signPublic = String(JSON.parse(body || "{}").signPublic ?? "");
       if (agentIdFor(signPublic) !== agentId) throw new HttpError(401, "unauthorized", "Agent id does not match the key");
     } else {
-      if (!troqo.ctx.agentExists(agentId)) throw new HttpError(401, "unknown_agent", "Register your public keys first");
       signPublic = troqo.publicKeys(agentId).signPublic;
     }
     const message = requestSigningString(req.method ?? "GET", path, timestamp, nonce, body);
     if (!verifyMessage(message, signature, signPublic)) throw new HttpError(401, "bad_signature", "Signature does not verify");
     nonces.set(key, Date.now() + 2 * CLOCK_SKEW_MS);
+    if (path !== "/v1/register") troqo.ctx.touch(agentId);
     if (nonces.size > 100_000) for (const [k, exp] of nonces) if (exp < Date.now()) nonces.delete(k);
     return agentId;
+  }
+
+  function requireAdmin(req: IncomingMessage) {
+    const token = String(req.headers.authorization ?? "").replace(/^Bearer\s+/i, "");
+    if (!opts.adminToken || !token || !safeEqual(token, opts.adminToken)) throw new HttpError(401, "unauthorized", "Admin token required");
   }
 
   async function serveFile(res: ServerResponse, file: string, cache = "public, max-age=300") {
@@ -221,7 +270,7 @@ export function startHttp(troqo: TroqoServer, opts: HttpOptions): Promise<Server
       // ---- public
       if (req.method === "GET") {
         if (path === "/health") return send(res, 200, { ok: true });
-        if (path === "/v1/pow") return send(res, 200, troqo.powChallenge());
+        if (path === "/v1/pow") return send(res, 200, powFor(ip));
         if (path === "/v1/certification/policy") return send(res, 200, troqo.certifier.policy, { "cache-control": "public, max-age=300" });
         if (path === "/v1/market") return send(res, 200, troqo.publicMarket(), { "cache-control": "public, max-age=15" });
         if (path === "/v1/missions/open") return send(res, 200, market.listOpen(url.searchParams.get("kind") ?? undefined));
@@ -230,26 +279,45 @@ export function startHttp(troqo: TroqoServer, opts: HttpOptions): Promise<Server
         if (path === "/api.md" || path === "/llms.txt") {
           if (await serveFile(res, docsFile)) return;
         }
-        if (path === "/admin/stats" || path === "/admin/export") {
-          const token = String(req.headers.authorization ?? "").replace(/^Bearer\s+/i, "");
-          if (!opts.adminToken || !token || !safeEqual(token, opts.adminToken)) throw new HttpError(401, "unauthorized", "Admin token required");
+        if (path === "/admin/stats" || path === "/admin/export" || path === "/admin/moderation") {
+          requireAdmin(req);
+          if (path === "/admin/moderation") return send(res, 200, troqo.moderation.cases(url.searchParams.get("status") ?? "operator"));
           return send(res, 200, path === "/admin/stats" ? troqo.stats() : work.resolvedTasks());
         }
+      }
+      // ---- operator actions (moderation, bans)
+      if (req.method === "POST" && path.startsWith("/admin/")) {
+        requireAdmin(req);
+        const b = JSON.parse((await readBody(req, 8192)) || "{}");
+        const reason = str(b.reason);
+        if (reason.trim().length < 5) throw new HttpError(400, "invalid_request", "reason: required, it is shown to the author");
+        let m: RegExpMatchArray | null;
+        if ((m = path.match(/^\/admin\/moderation\/([\w-]+)$/))) {
+          return send(res, 200, troqo.moderation.decide(m[1], oneOf(b.verdict, ["keep", "remove"]), "operator", reason));
+        }
+        if ((m = path.match(/^\/admin\/missions\/([\w-]+)\/remove$/))) return send(res, 200, troqo.moderation.remove(m[1], reason));
+        if ((m = path.match(/^\/admin\/agents\/([\w-]+)\/ban$/))) return send(res, 200, troqo.moderation.ban(m[1], reason));
+        throw new HttpError(404, "not_found", "No such admin action");
       }
 
       // ---- signed API
       if (path === "/v1/register" && req.method === "POST") {
-        const body = await readBody(req);
+        preAuthenticate(req, path);
+        const body = await readBody(req, 4096);
         const agentId = authenticate(req, pathWithQuery, body);
+        if (troqo.ctx.agentExists(agentId)) return send(res, 200, { agentId, created: false });
         if (!registrations.allow(ip)) throw new HttpError(429, "rate_limited", "Too many new identities from this address");
         const b = JSON.parse(body);
-        const out = troqo.register(String(b.signPublic), String(b.boxPublic), b.pow === undefined ? "" : String(b.pow));
+        const str = (v: unknown) => (v === undefined ? "" : String(v));
+        const out = troqo.register(str(b.signPublic), str(b.boxPublic), str(b.boxSignature), str(b.pow), powFor(ip));
         if (out.agentId !== agentId) throw new HttpError(401, "unauthorized", "Agent id does not match the key");
+        if (out.created) networkRegistrations.allow(networkKey(ip));
         return send(res, out.created ? 201 : 200, out);
       }
       if (path.startsWith("/v1/")) {
         const route = routes.find(([m, re]) => m === req.method && re.test(path));
         if (!route) throw new HttpError(404, "not_found", "No such endpoint (see /api.md)");
+        preAuthenticate(req, path);
         const body = req.method === "POST" ? await readBody(req) : "";
         const agentId = authenticate(req, pathWithQuery, body);
         let parsed: unknown = {};
@@ -265,7 +333,12 @@ export function startHttp(troqo: TroqoServer, opts: HttpOptions): Promise<Server
 
       // ---- website
       if (req.method === "GET" || req.method === "HEAD") {
-        let rel = decodeURIComponent(path);
+        let rel: string;
+        try {
+          rel = decodeURIComponent(path);
+        } catch {
+          throw new HttpError(400, "bad_path", "Malformed URL");
+        }
         if (rel.endsWith("/")) rel += "index.html";
         if (!extname(rel)) rel += ".html";
         const file = normalize(join(siteDir, rel));
@@ -297,6 +370,14 @@ export function addressKey(ip: string): string {
   const right = ip.includes("::") && tail ? tail.split(":") : [];
   const groups = ip.includes("::") ? [...left, ...Array(8 - left.length - right.length).fill("0"), ...right] : left;
   return groups.slice(0, 4).map((g) => g.replace(/^0+(?=.)/, "")).join(":") + "::/64";
+}
+
+/** The network a registration surge is attributed to: an IPv4 /24 or an IPv6 /48. */
+export function networkKey(ip: string): string {
+  const k = addressKey(ip);
+  if (k.endsWith("::/64")) return k.split(":").slice(0, 3).join(":") + "::/48";
+  const v4 = k.match(/^(\d+\.\d+\.\d+)\.\d+$/);
+  return v4 ? `${v4[1]}.0/24` : k;
 }
 
 function str(v: unknown): string {

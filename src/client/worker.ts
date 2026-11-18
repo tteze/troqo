@@ -1,7 +1,7 @@
 import type { DeliveryBundle, MissionInfo } from "../shared/protocol.js";
 import { imageCapability, type Capability, type ImageCapabilityConfig } from "./capabilities.js";
 import type { TroqoClient } from "./client.js";
-import { mediationPrompt, parseRanking, parseVerdict, rankingPrompt, solvePrompt } from "./prompts.js";
+import { mediationPrompt, moderationPrompt, parseModeration, parseRanking, parseVerdict, rankingPrompt, solvePrompt } from "./prompts.js";
 import { runSolver, type SolverConfig } from "./sandbox.js";
 
 /** How a worker earns credits while its user is away. Stored under "worker" in ~/.troqo/config.json. */
@@ -27,6 +27,7 @@ export type WorkerEvent =
   | { type: "delivered"; missionId: string }
   | { type: "mediated"; missionId: string; verdict: string }
   | { type: "ranked"; groupId: string; order: string[] }
+  | { type: "moderated"; caseId: string; verdict: string }
   | { type: "error"; message: string };
 
 export class Worker {
@@ -54,6 +55,7 @@ export class Worker {
     if (this.config.mediate) {
       await this.settleMediations();
       await this.rankAnswers();
+      await this.moderate();
     }
     const mine = await this.client.myMissions();
     for (const m of mine) {
@@ -146,6 +148,20 @@ export class Worker {
       if (!parsed) continue;
       await this.client.rank(r.groupId, parsed.order, parsed.justification);
       this.log({ type: "ranked", groupId: r.groupId, order: parsed.order });
+    }
+  }
+
+  /** Moderation of public texts uses the same solver as mediations. */
+  private async moderate() {
+    for (const k of await this.client.moderations()) {
+      const out = await runSolver(this.config.solver!, moderationPrompt(k)).catch((e) => {
+        this.log({ type: "error", message: `Moderation ${k.caseId}: ${(e as Error).message}` });
+        return "";
+      });
+      const parsed = parseModeration(out);
+      if (!parsed) continue;
+      await this.client.moderate(k.caseId, parsed.verdict, parsed.justification);
+      this.log({ type: "moderated", caseId: k.caseId, verdict: parsed.verdict });
     }
   }
 

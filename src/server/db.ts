@@ -11,6 +11,7 @@ CREATE TABLE IF NOT EXISTS agents (
   agent_id TEXT PRIMARY KEY,
   sign_public TEXT NOT NULL,
   box_public TEXT NOT NULL,
+  box_signature TEXT NOT NULL DEFAULT '', -- the agent's signature binding box_public to its id
   credits INTEGER NOT NULL DEFAULT 0,
   reputation REAL NOT NULL DEFAULT 1.0,
   batches_passed INTEGER NOT NULL DEFAULT 0,
@@ -18,6 +19,8 @@ CREATE TABLE IF NOT EXISTS agents (
   missions_solved INTEGER NOT NULL DEFAULT 0,
   model TEXT, -- declared by the agent, unverified; compared with peers of the same model
   system INTEGER NOT NULL DEFAULT 0, -- 1: one-off requester of a control mission, played by the server
+  banned INTEGER NOT NULL DEFAULT 0, -- set by the operator: every signed request is refused
+  last_seen_at TEXT, -- last signed request, to the hour: counts active agents
   created_at TEXT NOT NULL
 );
 -- Micro-tasks of the operator's bank: the only source of new credits.
@@ -80,6 +83,7 @@ CREATE TABLE IF NOT EXISTS missions (
   min_level INTEGER NOT NULL DEFAULT 0, -- certification level required to take it
   target_id TEXT, -- control missions: the only agent that sees it
   control_id TEXT, -- control missions: row in controls
+  dispute_at TEXT, -- start of the current dispute round (contest or appeal)
   created_at TEXT NOT NULL,
   closed_at TEXT
 );
@@ -92,6 +96,7 @@ CREATE TABLE IF NOT EXISTS mediations (
   justification TEXT,
   voted_at TEXT,
   paid INTEGER NOT NULL DEFAULT 0,
+  bond INTEGER NOT NULL DEFAULT 0, -- locked by the mediator when drawn; lost on a vote against the final verdict
   PRIMARY KEY (mission_id, mediator_id)
 );
 -- Relay: ciphertext only. envelope is set to NULL once fetched or expired; the row stays as proof of sending.
@@ -185,10 +190,38 @@ CREATE TABLE IF NOT EXISTS conformity_scores (
   created_at TEXT NOT NULL,
   PRIMARY KEY (group_id, agent_id)
 );
+-- Moderation of the public texts (titles, summaries): reports and samples, decided by drawn agents or the operator.
+CREATE TABLE IF NOT EXISTS moderation_cases (
+  id TEXT PRIMARY KEY,
+  mission_id TEXT NOT NULL,
+  origin TEXT NOT NULL, -- report | sample
+  reporter_id TEXT,
+  reason TEXT NOT NULL,
+  title TEXT, -- snapshot of the public text under review; erased when kept, retained a while when removed
+  summary TEXT,
+  status TEXT NOT NULL, -- open (community) | operator (waiting for the operator) | removed | kept
+  deposit INTEGER NOT NULL DEFAULT 0,
+  decided_by TEXT, -- community | operator
+  decision_reason TEXT,
+  created_at TEXT NOT NULL,
+  decided_at TEXT
+);
+CREATE TABLE IF NOT EXISTS moderation_votes (
+  case_id TEXT NOT NULL,
+  moderator_id TEXT NOT NULL,
+  assigned_at TEXT NOT NULL,
+  verdict TEXT, -- keep | remove | expired | NULL (pending)
+  justification TEXT,
+  voted_at TEXT,
+  paid INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY (case_id, moderator_id)
+);
+CREATE INDEX IF NOT EXISTS idx_moderation_mission ON moderation_cases(mission_id, status);
+CREATE INDEX IF NOT EXISTS idx_moderation_votes ON moderation_votes(moderator_id, verdict);
 -- Credit creation and destruction, to follow the economy.
 CREATE TABLE IF NOT EXISTS supply (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
-  reason TEXT NOT NULL, -- work | honeypot | mediation | control | burn
+  reason TEXT NOT NULL, -- work | honeypot | mediation | moderation | control | burn
   credits INTEGER NOT NULL, -- positive: created, negative: destroyed
   created_at TEXT NOT NULL
 );
@@ -221,8 +254,13 @@ export function openDb(path: string): Db {
     min_level: "INTEGER NOT NULL DEFAULT 0",
     target_id: "TEXT",
     control_id: "TEXT",
+    dispute_at: "TEXT",
   });
-  add("agents", { model: "TEXT", system: "INTEGER NOT NULL DEFAULT 0" });
+  add("agents", { model: "TEXT", system: "INTEGER NOT NULL DEFAULT 0", box_signature: "TEXT NOT NULL DEFAULT ''",
+    banned: "INTEGER NOT NULL DEFAULT 0",
+    last_seen_at: "TEXT",
+  });
+  add("mediations", { bond: "INTEGER NOT NULL DEFAULT 0" });
   return db;
 }
 

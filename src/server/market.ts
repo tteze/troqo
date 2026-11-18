@@ -2,6 +2,8 @@ import { randomUUID } from "node:crypto";
 import { tx } from "./db.js";
 import { check, Context, minutesAgo, now, plusMinutes, SYSTEM_AGENT } from "./context.js";
 import type { Certifier } from "./certification/certifier.js";
+import type { Moderation } from "./moderation.js";
+import { corruptAnswer, GENERATORS } from "./certification/generators.js";
 import { seal, sha256 } from "../shared/crypto.js";
 import { TroqoError } from "../shared/errors.js";
 import {
@@ -72,6 +74,19 @@ export interface HoneypotDefinition {
   verdict: Verdict;
 }
 
+interface HoneypotRow {
+  id: string;
+  kind: string;
+  title: string;
+  summary: string;
+  spec: string;
+  acceptance: string;
+  delivery_mime: string;
+  delivery_content: string;
+  contest_reason: string;
+  verdict: Verdict;
+}
+
 export interface PostMissionInput {
   kind: string;
   title: string;
@@ -85,6 +100,8 @@ export interface PostMissionInput {
 export class Market {
   /** Set by TroqoServer. Certification rules live in their own module and policy. */
   certifier?: Certifier;
+  /** Set by TroqoServer. Reviews public titles and summaries. */
+  moderation?: Moderation;
 
   constructor(private readonly c: Context) {}
 
@@ -142,6 +159,7 @@ export class Market {
         )
         .run(id, agentId, kind, input.title.trim(), input.summary.trim(), price, input.specHash, minLevel, now());
     });
+    this.moderation?.maybeSample(id);
     return this.get(agentId, id);
   }
 
@@ -185,6 +203,11 @@ export class Market {
     check(m.status === "delivered", "invalid_state", `Mission is ${m.status}, not delivered`);
     if (decision === "accept") {
       this.finalize(missionId, "accept", "accepted by the requester");
+    } else if (!this.c.communityActive()) {
+      check(reason && reason.trim().length >= 10, "invalid_review", "Explain in a sentence which criterion is not met");
+      // Too few agents on the market to draw a mediator: the price is shared, nobody wins by contesting.
+      this.db.prepare(`UPDATE missions SET contest_reason = ? WHERE id = ? AND status = 'delivered'`).run(reason.trim().slice(0, 1000), missionId);
+      this.split(missionId, "contested before community mediation started");
     } else {
       check(reason && reason.trim().length >= 10, "invalid_review", "Explain in a sentence which criterion is not met");
       const fee = this.cfg.mediationFeeCredits;
@@ -192,10 +215,10 @@ export class Market {
       tx(this.db, () => {
         const res = this.db
           .prepare(
-            `UPDATE missions SET status = 'disputed', contest_reason = ?, requester_deposit = requester_deposit + ?
+            `UPDATE missions SET status = 'disputed', contest_reason = ?, requester_deposit = requester_deposit + ?, dispute_at = ?
              WHERE id = ? AND status = 'delivered'`,
           )
-          .run(reason.trim().slice(0, 1000), fee, missionId);
+          .run(reason.trim().slice(0, 1000), fee, now(), missionId);
         check(res.changes === 1, "invalid_state", "Mission was already reviewed");
         this.c.credit(agentId, -fee);
         this.draw(missionId, 1, 1);
@@ -214,13 +237,14 @@ export class Market {
     if (decision === "accept") {
       this.finalize(missionId, m.verdict, "first verdict accepted");
     } else {
+      check(this.c.communityActive(), "appeal_unavailable", "Appeals need community mediation, which is not on yet: accept the verdict");
       const fee = this.cfg.mediationFeeCredits * this.cfg.appealMediators;
       this.requireDeposit(agentId, fee, "Appealing");
       const col = agentId === m.requester_id ? "requester_deposit" : "solver_deposit";
       tx(this.db, () => {
         const res = this.db
-          .prepare(`UPDATE missions SET status = 'appealed', ${col} = ${col} + ? WHERE id = ? AND status = 'mediated'`)
-          .run(fee, missionId);
+          .prepare(`UPDATE missions SET status = 'appealed', ${col} = ${col} + ?, dispute_at = ? WHERE id = ? AND status = 'mediated'`)
+          .run(fee, now(), missionId);
         check(res.changes === 1, "invalid_state", "Verdict was already answered");
         this.c.credit(agentId, -fee);
         this.draw(missionId, 2, this.cfg.appealMediators);
@@ -286,7 +310,6 @@ export class Market {
       check(res.changes === 1, "mission_not_open", "This mission was taken by someone else or is closed");
       this.c.credit(agentId, -bond);
     });
-    if (!m.control_id) this.certifier?.afterTake(agentId, m.kind);
     return this.get(agentId, missionId);
   }
 
@@ -324,6 +347,10 @@ export class Market {
       .prepare(`SELECT 1 FROM mediations WHERE mission_id = ? AND mediator_id = ? AND verdict IS NULL`)
       .get(missionId, toId);
     check(assigned, "forbidden", "This agent is not a pending mediator of the mission");
+    const already = this.db
+      .prepare(`SELECT 1 FROM messages WHERE mission_id = ? AND kind = ? AND from_id = ? AND to_id = ?`)
+      .get(missionId, `evidence-${piece}`, agentId, toId);
+    check(!already, "evidence_already_sent", "Your piece was already sent to this mediator");
     this.checkEnvelope(envelope);
     this.message(missionId, `evidence-${piece}`, agentId, toId, envelope);
     return { missionId, to: toId, piece };
@@ -372,30 +399,48 @@ export class Market {
     );
 
     const tasks: InboxTask[] = [];
+    const keys = (a: { sign_public: string; box_public: string; box_signature: string }) => ({
+      toSignPublic: a.sign_public,
+      toBoxPublic: a.box_public,
+      toBoxSignature: a.box_signature,
+    });
     const handoffs = this.db
       .prepare(
-        `SELECT m.id, m.solver_id, a.box_public FROM missions m JOIN agents a ON a.agent_id = m.solver_id
+        `SELECT m.id, m.solver_id, a.sign_public, a.box_public, a.box_signature FROM missions m JOIN agents a ON a.agent_id = m.solver_id
          WHERE m.requester_id = ? AND m.status = 'taken'`,
       )
-      .all(agentId) as { id: string; solver_id: string; box_public: string }[];
-    for (const h of handoffs) tasks.push({ type: "send_spec", missionId: h.id, toId: h.solver_id, toBoxPublic: h.box_public });
+      .all(agentId) as { id: string; solver_id: string; sign_public: string; box_public: string; box_signature: string }[];
+    for (const h of handoffs) tasks.push({ type: "send_spec", missionId: h.id, toId: h.solver_id, ...keys(h) });
 
     const owed = this.db
       .prepare(
-        `SELECT m.id, m.requester_id, d.mediator_id, a.box_public FROM mediations d
+        `SELECT m.id, m.requester_id, d.mediator_id, a.sign_public, a.box_public, a.box_signature FROM mediations d
          JOIN missions m ON m.id = d.mission_id JOIN agents a ON a.agent_id = d.mediator_id
          WHERE d.verdict IS NULL AND m.status IN ('disputed', 'appealed') AND m.honeypot_id IS NULL
            AND (m.requester_id = ? OR m.solver_id = ?)`,
       )
-      .all(agentId, agentId) as { id: string; requester_id: string; mediator_id: string; box_public: string }[];
+      .all(agentId, agentId) as {
+      id: string;
+      requester_id: string;
+      mediator_id: string;
+      sign_public: string;
+      box_public: string;
+      box_signature: string;
+    }[];
     for (const o of owed) {
       const piece = o.requester_id === agentId ? "spec" : "delivery";
       const sent = this.db
         .prepare(`SELECT 1 FROM messages WHERE mission_id = ? AND kind = ? AND from_id = ? AND to_id = ?`)
         .get(o.id, `evidence-${piece}`, agentId, o.mediator_id);
-      if (!sent) tasks.push({ type: "send_evidence", missionId: o.id, piece, toId: o.mediator_id, toBoxPublic: o.box_public });
+      if (!sent) tasks.push({ type: "send_evidence", missionId: o.id, piece, toId: o.mediator_id, ...keys(o) });
     }
-    return { messages, tasks, mediations: this.pendingMediations(agentId), rankings: this.certifier?.pendingRankings(agentId) ?? [] };
+    return {
+      messages,
+      tasks,
+      mediations: this.pendingMediations(agentId),
+      rankings: this.certifier?.pendingRankings(agentId) ?? [],
+      moderations: this.moderation?.pending(agentId) ?? [],
+    };
   }
 
   /** Erases a fetched message's ciphertext. The row stays as proof that it was sent. */
@@ -437,7 +482,7 @@ export class Market {
     const mediator = !!this.db.prepare(`SELECT 1 FROM mediations WHERE mission_id = ? AND mediator_id = ?`).get(missionId, agentId);
     const listed = m.status === "open" && !m.honeypot_id && (!m.target_id || m.target_id === agentId);
     check(party || mediator || listed, "unknown_mission", `Unknown mission ${missionId}`);
-    return this.info(m, party || mediator);
+    return this.info(m, party || mediator, mediator && !party);
   }
 
   mine(agentId: string): MissionInfo[] {
@@ -560,37 +605,30 @@ export class Market {
 
   /**
    * Sometimes hands an eligible mediator a fake dispute with a known verdict. It looks exactly like
-   * a real one: same inbox, same evidence messages, sealed for the mediator by the server.
+   * a real one: same inbox, same evidence messages, sealed for the mediator by the server, same bond.
+   * Half of them come from the operator's private bank, the rest are generated fresh (see generateHoneypot),
+   * so there is no fixed list to memorize or share. They pay, so they respect the market-wide credit budget.
    */
   private maybeHoneypot(agentId: string) {
     if (this.cfg.honeypotRate <= 0 || Math.random() >= this.cfg.honeypotRate || !this.c.canMediate(agentId)) return;
-    const pending = this.db
+    const recent = this.db
       .prepare(
-        `SELECT 1 FROM mediations d JOIN missions m ON m.id = d.mission_id
-         WHERE d.mediator_id = ? AND d.verdict IS NULL AND m.honeypot_id IS NOT NULL`,
+        `SELECT COUNT(*) AS n, SUM(d.verdict IS NULL) AS pending FROM mediations d JOIN missions m ON m.id = d.mission_id
+         WHERE d.mediator_id = ? AND m.honeypot_id IS NOT NULL AND d.assigned_at >= ?`,
       )
-      .get(agentId);
-    if (pending) return;
-    const h = this.db
+      .get(agentId, minutesAgo(24 * 60)) as { n: number; pending: number | null };
+    if ((recent.pending ?? 0) > 0 || recent.n >= this.cfg.maxHoneypotsPerDay) return;
+    const { budget, minted } = this.c.faucet();
+    if (minted + this.cfg.mediationFeeCredits > budget) return;
+    const banked = this.db
       .prepare(
-        `SELECT * FROM honeypots WHERE id NOT IN (
+        `SELECT * FROM honeypots WHERE id NOT LIKE 'gen-%' AND id NOT IN (
            SELECT m.honeypot_id FROM mediations d JOIN missions m ON m.id = d.mission_id
            WHERE d.mediator_id = ? AND m.honeypot_id IS NOT NULL)
          ORDER BY RANDOM() LIMIT 1`,
       )
-      .get(agentId) as
-      | {
-          id: string;
-          kind: string;
-          title: string;
-          summary: string;
-          spec: string;
-          acceptance: string;
-          delivery_mime: string;
-          delivery_content: string;
-          contest_reason: string;
-        }
-      | undefined;
+      .get(agentId) as HoneypotRow | undefined;
+    const h = banked && Math.random() < 0.5 ? banked : (this.generateHoneypot() ?? banked);
     if (!h) return;
     const box = this.c.requireAgent(agentId).box_public;
     const spec = canonicalSpec({ spec: h.spec, acceptance: h.acceptance });
@@ -606,12 +644,46 @@ export class Market {
         )
         .run(id, SYSTEM_AGENT, h.kind, h.title, h.summary, 1 + Math.floor(Math.random() * 8), sha256(spec), SYSTEM_AGENT,
           t, t, sha256(delivery), h.delivery_mime, t, h.contest_reason, h.id, t);
-      this.db
-        .prepare(`INSERT INTO mediations (mission_id, round, mediator_id, assigned_at) VALUES (?, 1, ?, ?)`)
-        .run(id, agentId, t);
+      this.assignMediator(id, 1, agentId);
       this.message(id, "evidence-spec", SYSTEM_AGENT, agentId, seal(spec, box));
       this.message(id, "evidence-delivery", SYSTEM_AGENT, agentId, seal(delivery, box));
     });
+  }
+
+  /**
+   * A fresh fake dispute from a graded generator: either the right answer contested for a reason the
+   * criteria do not support (verdict: accept), or a subtly wrong answer contested rightly (verdict: refuse).
+   */
+  private generateHoneypot(): HoneypotRow | undefined {
+    const graded = GENERATORS.filter((g) => g.mode === "graded" && g.answer);
+    if (!graded.length) return undefined;
+    const g = graded[Math.floor(Math.random() * graded.length)];
+    const task = g.generate(g.difficulties[Math.floor(Math.random() * g.difficulties.length)]);
+    const truthful = Math.random() < 0.5;
+    const row: HoneypotRow = {
+      id: `gen-${randomUUID()}`,
+      kind: g.kind,
+      title: task.title,
+      summary: task.summary,
+      spec: task.spec,
+      acceptance: task.acceptance,
+      delivery_mime: "text/plain",
+      delivery_content: g.answer!(truthful ? task.expected : corruptAnswer(task.expected)),
+      contest_reason: truthful
+        ? ["I expected a longer, more detailed answer.", "The format is not the one I had in mind.", "I think the result is wrong, please redo it."][
+            Math.floor(Math.random() * 3)
+          ]
+        : "The values in the answer do not match the data given in the spec.",
+      verdict: truthful ? "accept" : "refuse",
+    };
+    this.db
+      .prepare(
+        `INSERT INTO honeypots (id, kind, title, summary, spec, acceptance, delivery_mime, delivery_content, contest_reason, verdict)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      )
+      .run(row.id, row.kind, row.title, row.summary, row.spec, row.acceptance, row.delivery_mime, row.delivery_content,
+        row.contest_reason, row.verdict);
+    return row;
   }
 
   private closeHoneypot(m: MissionRow, mediatorId: string, verdict: Verdict) {
@@ -626,6 +698,7 @@ export class Market {
         this.c.supply("honeypot", this.cfg.mediationFeeCredits);
         this.db.prepare(`UPDATE mediations SET paid = 1 WHERE mission_id = ? AND mediator_id = ?`).run(m.id, mediatorId);
       }
+      this.settleMediator(m.id, mediatorId, right ? "right" : "wrong");
       this.c.reputation(mediatorId, right);
     });
   }
@@ -638,7 +711,7 @@ export class Market {
     return m;
   }
 
-  private info(m: MissionRow, involved = false): MissionInfo {
+  private info(m: MissionRow, involved = false, asMediator = false): MissionInfo {
     const honeypot = !!m.honeypot_id;
     const info: MissionInfo = {
       missionId: m.id,
@@ -655,7 +728,9 @@ export class Market {
     if (m.status === "open") info.bondCredits = this.bondFor(m.price_credits);
     else if (m.solver_bond > 0 && involved) info.bondCredits = m.solver_bond;
     if (involved) {
-      if (m.solver_id && !honeypot) info.solverId = m.solver_id;
+      // Mediators see the dispute, never who the parties are: real disputes and fake ones look alike.
+      if (asMediator) info.requesterId = "";
+      if (m.solver_id && !honeypot && !asMediator) info.solverId = m.solver_id;
       if (m.delivery_hash) info.deliveryHash = m.delivery_hash;
       if (m.delivery_mime) info.deliveryMime = m.delivery_mime;
       if (m.contest_reason) info.contestReason = m.contest_reason;
@@ -698,6 +773,14 @@ export class Market {
 
   /** @internal Puts ciphertext in the relay. Used by the certifier for its control missions. */
   message(missionId: string, kind: string, fromId: string, toId: string, envelope: string) {
+    const pending = this.db
+      .prepare(`SELECT COALESCE(SUM(size), 0) AS n FROM messages WHERE from_id = ? AND envelope IS NOT NULL`)
+      .get(fromId) as { n: number };
+    check(
+      fromId === SYSTEM_AGENT || pending.n + envelope.length <= this.cfg.maxRelayCharsPerAgent,
+      "relay_quota",
+      "Too much of your content is waiting in the relay; it frees up as recipients fetch it",
+    );
     this.db
       .prepare(
         `INSERT INTO messages (id, mission_id, kind, from_id, to_id, envelope, size, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
@@ -707,6 +790,7 @@ export class Market {
 
   /** Draws mediators among agents with a track record, never the parties nor agents already involved. */
   draw(missionId: string, round: number, seats: number) {
+    if (!this.c.communityActive()) return;
     const m = this.row(missionId);
     const taken = this.db
       .prepare(
@@ -715,18 +799,39 @@ export class Market {
       .get(missionId, round) as { n: number };
     const missing = seats - taken.n;
     if (missing <= 0) return;
+    const cond = this.c.mediatorCondition();
     const picks = this.db
       .prepare(
         `SELECT agent_id FROM agents
-         WHERE batches_passed >= ? AND reputation >= ? AND agent_id NOT IN (?, ?)
+         WHERE ${cond.sql} AND agent_id NOT IN (?, ?)
            AND agent_id NOT IN (SELECT mediator_id FROM mediations WHERE mission_id = ?)
          ORDER BY RANDOM() LIMIT ?`,
       )
-      .all(this.cfg.mediatorMinBatches, this.cfg.mediatorMinReputation, m.requester_id, m.solver_id ?? "", missionId, missing) as {
-      agent_id: string;
-    }[];
-    const ins = this.db.prepare(`INSERT INTO mediations (mission_id, round, mediator_id, assigned_at) VALUES (?, ?, ?, ?)`);
-    for (const p of picks) ins.run(missionId, round, p.agent_id, now());
+      .all(...cond.params, m.requester_id, m.solver_id ?? "", missionId, missing) as { agent_id: string }[];
+    for (const p of picks) this.assignMediator(missionId, round, p.agent_id);
+  }
+
+  /** Seats a mediator and locks its bond. */
+  private assignMediator(missionId: string, round: number, mediatorId: string) {
+    const bond = Math.min(this.cfg.mediatorBondCredits, Math.max(0, this.c.balance(mediatorId)));
+    this.c.credit(mediatorId, -bond);
+    this.db
+      .prepare(`INSERT INTO mediations (mission_id, round, mediator_id, assigned_at, bond) VALUES (?, ?, ?, ?, ?)`)
+      .run(missionId, round, mediatorId, now(), bond);
+  }
+
+  /**
+   * Settles a mediator's bond. Right vote: bond back, plus the fee (paid by whoever the caller says).
+   * Wrong vote or no vote: the bond is burned. Released (the dispute ended without its vote, not its fault): bond back.
+   */
+  private settleMediator(missionId: string, mediatorId: string, outcome: "right" | "wrong" | "released") {
+    const row = this.db.prepare(`SELECT bond FROM mediations WHERE mission_id = ? AND mediator_id = ?`).get(missionId, mediatorId) as
+      | { bond: number }
+      | undefined;
+    if (!row || row.bond === 0) return;
+    if (outcome === "wrong") this.c.supply("burn", -row.bond);
+    else this.c.credit(mediatorId, row.bond);
+    this.db.prepare(`UPDATE mediations SET bond = 0 WHERE mission_id = ? AND mediator_id = ?`).run(missionId, mediatorId);
   }
 
   private advance(missionId: string) {
@@ -757,6 +862,7 @@ export class Market {
    * nothing and lose reputation. Reputation from missions only counts once per pair of agents per month.
    */
   finalize(missionId: string, verdict: Verdict, reason: string) {
+    let acceptedReal: { solver: string; kind: string } | undefined;
     tx(this.db, () => {
       const m = this.row(missionId);
       const closed = this.db
@@ -809,7 +915,43 @@ export class Market {
           this.c.credit(v.mediator_id, fee);
           this.db.prepare(`UPDATE mediations SET paid = 1 WHERE mission_id = ? AND mediator_id = ?`).run(missionId, v.mediator_id);
         }
+        this.settleMediator(missionId, v.mediator_id, right ? "right" : "wrong");
         this.c.reputation(v.mediator_id, right);
+      }
+      for (const p of this.db
+        .prepare(`SELECT mediator_id FROM mediations WHERE mission_id = ? AND verdict IS NULL`)
+        .all(missionId) as { mediator_id: string }[]) {
+        this.settleMediator(missionId, p.mediator_id, "released");
+      }
+      this.db.prepare(`UPDATE mediations SET verdict = 'expired' WHERE mission_id = ? AND verdict IS NULL`).run(missionId);
+      if (verdict === "accept" && !m.control_id && !m.honeypot_id) acceptedReal = { solver, kind: m.kind };
+    });
+    // Certified solvers get hidden controls among the missions they complete, not the ones they merely take.
+    if (acceptedReal) this.certifier?.afterAccepted(acceptedReal.solver, acceptedReal.kind);
+  }
+
+  /**
+   * Closes a contested mission without a verdict: the solver gets half the price (rounded down), the
+   * requester the rest. No fee, no burn, deposits returned, reputations unchanged. Used while too few
+   * agents are active to draw mediators, and when a dispute finds none in time.
+   */
+  split(missionId: string, reason: string) {
+    tx(this.db, () => {
+      const m = this.row(missionId);
+      const res = this.db
+        .prepare(
+          `UPDATE missions SET status = 'split', closed_at = ?, outcome_reason = ?, requester_deposit = 0, solver_deposit = 0
+           WHERE id = ? AND status IN ('delivered', 'disputed')`,
+        )
+        .run(now(), reason, missionId);
+      if (res.changes !== 1) throw new TroqoError("invalid_state", `Mission is already ${m.status}`);
+      const half = Math.floor(m.price_credits / 2);
+      this.c.credit(m.solver_id!, half + m.solver_deposit);
+      this.c.credit(m.requester_id, m.price_credits - half + m.requester_deposit);
+      for (const p of this.db
+        .prepare(`SELECT mediator_id FROM mediations WHERE mission_id = ? AND verdict IS NULL`)
+        .all(missionId) as { mediator_id: string }[]) {
+        this.settleMediator(missionId, p.mediator_id, "released");
       }
       this.db.prepare(`UPDATE mediations SET verdict = 'expired' WHERE mission_id = ? AND verdict IS NULL`).run(missionId);
     });
@@ -847,7 +989,7 @@ export class Market {
     }
     // Not reviewed in time: accepted.
     for (const r of this.db
-      .prepare(`SELECT id FROM missions WHERE status = 'delivered' AND delivered_at < ?`)
+      .prepare(`SELECT id FROM missions WHERE status = 'delivered' AND control_id IS NULL AND delivered_at < ?`)
       .all(minutesAgo(cfg.reviewTtlMinutes)) as { id: string }[]) {
       this.finalize(r.id, "accept", "not reviewed in time");
     }
@@ -858,10 +1000,14 @@ export class Market {
       this.finalize(r.id, r.verdict, "not appealed in time");
     }
     this.missingEvidence();
-    // Mediators who did not vote in time are replaced; honeypots just close.
-    this.db
-      .prepare(`UPDATE mediations SET verdict = 'expired' WHERE verdict IS NULL AND assigned_at < ?`)
-      .run(minutesAgo(cfg.mediationTtlMinutes));
+    // Mediators who did not vote in time lose their bond and are replaced; honeypots just close.
+    for (const d of this.db
+      .prepare(`SELECT mission_id, mediator_id FROM mediations WHERE verdict IS NULL AND assigned_at < ?`)
+      .all(minutesAgo(cfg.mediationTtlMinutes)) as { mission_id: string; mediator_id: string }[]) {
+      this.settleMediator(d.mission_id, d.mediator_id, "wrong");
+      this.c.reputation(d.mediator_id, false);
+      this.db.prepare(`UPDATE mediations SET verdict = 'expired' WHERE mission_id = ? AND mediator_id = ?`).run(d.mission_id, d.mediator_id);
+    }
     this.db
       .prepare(
         `UPDATE missions SET status = 'cancelled', closed_at = ?, outcome_reason = 'control not answered'
@@ -874,6 +1020,18 @@ export class Market {
       .all() as { id: string; status: MissionStatus }[]) {
       this.draw(d.id, d.status === "disputed" ? 1 : 2, d.status === "disputed" ? 1 : cfg.appealMediators);
     }
+    // No mediator found in time: a dispute is split, an appeal leaves the first verdict standing.
+    for (const d of this.db
+      .prepare(
+        `SELECT id, status, verdict FROM missions m WHERE status IN ('disputed', 'appealed') AND honeypot_id IS NULL AND control_id IS NULL
+           AND dispute_at < ? AND NOT EXISTS (SELECT 1 FROM mediations x WHERE x.mission_id = m.id
+             AND x.round = (CASE WHEN m.status = 'disputed' THEN 1 ELSE 2 END) AND (x.verdict IS NULL OR x.verdict != 'expired'))`,
+      )
+      .all(minutesAgo(cfg.mediationWaitMinutes)) as { id: string; status: MissionStatus; verdict: Verdict | null }[]) {
+      if (d.status === "disputed") this.split(d.id, "no mediator available");
+      else this.finalize(d.id, d.verdict!, "no appeal mediator available");
+    }
+    this.moderation?.sweep();
     this.certifier?.sweep();
     // Relay: ciphertext is kept at most messageTtlDays.
     this.db

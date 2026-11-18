@@ -1,5 +1,5 @@
 import { randomInt, randomUUID } from "node:crypto";
-import { generateIdentity, open, seal, sha256 } from "../../shared/crypto.js";
+import { generateIdentity, open, seal, sha256, signBoxKey } from "../../shared/crypto.js";
 import { TroqoError } from "../../shared/errors.js";
 import {
   canonicalSpec,
@@ -14,6 +14,7 @@ import { tx } from "../db.js";
 import { check, Context, minutesAgo, now, plusMinutes, SYSTEM_AGENT } from "../context.js";
 import type { Market } from "../market.js";
 import { generatorById, pickGenerator } from "./generators.js";
+import { runnerBusy } from "./code-runner.js";
 import type { CertificationPolicy } from "./policy.js";
 
 /**
@@ -153,8 +154,11 @@ export class Certifier {
 
   // ------------------------------------------------------------------ hidden controls
 
-  /** Called after an agent takes a real mission: sometimes queues a hidden control for it. */
-  afterTake(agentId: string, kind: string) {
+  /**
+   * Called when a real mission an agent solved is accepted: sometimes queues a hidden control for it.
+   * Triggering on acceptance (not on taking) means controls cannot be farmed by taking cheap missions.
+   */
+  afterAccepted(agentId: string, kind: string) {
     const level = this.level(agentId, kind);
     const model = this.model(agentId);
     const conformityPossible = this.policy.conformity.enabled && !!model && !!pickGenerator(kind, "open");
@@ -202,8 +206,8 @@ export class Certifier {
     const specHash = sha256(canonicalSpec({ spec: task.spec, acceptance: task.acceptance }));
     tx(this.db, () => {
       this.db
-        .prepare(`INSERT INTO agents (agent_id, sign_public, box_public, created_at, system) VALUES (?, ?, ?, ?, 1)`)
-        .run(pseudo.agentId, pseudo.signPublic, pseudo.boxPublic, t);
+        .prepare(`INSERT INTO agents (agent_id, sign_public, box_public, box_signature, created_at, system) VALUES (?, ?, ?, ?, ?, 1)`)
+        .run(pseudo.agentId, pseudo.signPublic, pseudo.boxPublic, signBoxKey(pseudo), t);
       this.db
         .prepare(
           `INSERT INTO missions (id, requester_id, kind, title, summary, price_credits, spec_hash, status, solver_id, taken_at,
@@ -345,9 +349,19 @@ export class Certifier {
     }
   }
 
+  /** Asynchronous gradings in flight (code runs), by mission: one at a time per mission. */
+  private readonly grading = new Map<string, Promise<void>>();
+
+  /** Resolves once every grading in flight is applied. */
+  async idle(): Promise<void> {
+    while (this.grading.size) await Promise.all([...this.grading.values()]);
+  }
+
   private grade(missionId: string) {
+    if (this.grading.has(missionId)) return;
     const k = this.control(missionId);
-    if (!k) return;
+    // A conformity answer stays "delivered" until ranked: it is read once, then kept for the rankers.
+    if (!k || (k.purpose === "conformity" && k.delivery)) return;
     const m = this.db.prepare(`SELECT delivery_hash, solver_id FROM missions WHERE id = ?`).get(missionId) as {
       delivery_hash: string;
       solver_id: string;
@@ -363,19 +377,49 @@ export class Certifier {
       } catch {
         delivery = undefined;
       }
-      this.db.prepare(`UPDATE messages SET envelope = NULL, fetched_at = ? WHERE id = ?`).run(now(), msg.id);
     }
+    // The ciphertext is erased only once the grade is applied, so a restart mid-grading loses nothing.
+    const consumed = () => {
+      if (msg) this.db.prepare(`UPDATE messages SET envelope = NULL, fetched_at = ? WHERE id = ?`).run(now(), msg.id);
+    };
 
     if (k.purpose === "conformity") {
-      this.db.prepare(`UPDATE controls SET delivery = ? WHERE id = ?`).run(delivery ? JSON.stringify(delivery) : null, k.id);
-      this.record(k, !!delivery);
-      this.market.finalize(missionId, delivery ? "accept" : "refuse", delivery ? "accepted by the requester" : "unreadable delivery");
+      consumed();
+      // Not paid yet: an open-ended answer is paid once peers have ranked it (see score).
+      if (!delivery) {
+        this.record(k, false);
+        this.market.finalize(missionId, "refuse", "unreadable delivery");
+        return;
+      }
+      this.db.prepare(`UPDATE controls SET delivery = ? WHERE id = ?`).run(JSON.stringify(delivery), k.id);
       if (k.group_id) this.maybeStartRanking(k.group_id);
       return;
     }
 
     const g = generatorById(k.generator);
-    const passed = !!delivery && !!g?.grade && delivery.mime.startsWith("text/") && g.grade(JSON.parse(k.expected), delivery.content);
+    const usable = !!delivery && !!g?.grade && delivery.mime.startsWith("text/");
+    if (usable && g!.runsCode && runnerBusy()) return; // retried on a later sweep
+    const result = usable ? g!.grade!(JSON.parse(k.expected), delivery!.content) : false;
+    if (typeof result === "boolean") {
+      consumed();
+      this.applyGrade(missionId, k, result);
+      return;
+    }
+    // Code runs in a child process: the server keeps serving meanwhile.
+    const job = result
+      .catch(() => false)
+      .then((passed) => {
+        const still = this.db.prepare(`SELECT 1 FROM missions WHERE id = ? AND status = 'delivered'`).get(missionId);
+        if (!still) return;
+        consumed();
+        this.applyGrade(missionId, k, passed);
+      })
+      .catch((err) => console.error(`troqo: grading ${missionId} failed:`, err))
+      .finally(() => this.grading.delete(missionId));
+    this.grading.set(missionId, job);
+  }
+
+  private applyGrade(missionId: string, k: ControlRow, passed: boolean) {
     this.record(k, passed);
     if (passed) {
       this.market.finalize(missionId, "accept", "accepted by the requester");
@@ -384,9 +428,9 @@ export class Certifier {
     } else {
       // A hidden control is contested like a real mission, so a mediator also gets checked against a known verdict.
       this.db
-        .prepare(`UPDATE missions SET status = 'disputed', contest_reason = ? WHERE id = ? AND status = 'delivered'`)
-        .run(`The delivery does not meet the acceptance criteria: ${k.acceptance}`, missionId);
-      this.market.draw(missionId, 1, 1);
+        .prepare(`UPDATE missions SET status = 'disputed', contest_reason = ?, dispute_at = ? WHERE id = ? AND status = 'delivered'`)
+        .run(`The delivery does not meet the acceptance criteria: ${k.acceptance}`, now(), missionId);
+      if (this.c.communityActive()) this.market.draw(missionId, 1, 1);
       const drawn = this.db.prepare(`SELECT 1 FROM mediations WHERE mission_id = ?`).get(missionId);
       if (!drawn) this.market.finalize(missionId, "refuse", "missing evidence");
     }
@@ -460,7 +504,7 @@ export class Certifier {
   }
 
   /** Once enough agents of the same model answered, rankers receive the answers, sealed and shuffled. */
-  private maybeStartRanking(groupId: string) {
+  private maybeStartRanking(groupId: string, force = false) {
     const cp = this.policy.conformity;
     const group = this.db.prepare(`SELECT * FROM conformity_groups WHERE id = ?`).get(groupId) as {
       id: string;
@@ -475,29 +519,28 @@ export class Certifier {
     const answers = this.db
       .prepare(`SELECT id, agent_id, delivery FROM controls WHERE group_id = ? AND delivery IS NOT NULL`)
       .all(groupId) as { id: string; agent_id: string; delivery: string }[];
-    if (answers.length < cp.groupSize) return;
+    if (answers.length < cp.groupSize && !(force && answers.length >= 2)) return;
 
     const members = answers.map((a) => a.agent_id);
+    const cond = this.c.mediatorCondition(); // rankers must qualify like mediators
     const eligible = (sameModel: boolean, n: number, exclude: string[]) =>
       (
         this.db
           .prepare(
-            `SELECT agent_id FROM agents WHERE system = 0 AND batches_passed >= ? AND reputation >= ?
+            `SELECT agent_id FROM agents WHERE ${cond.sql}
                AND (model IS ?) = ? AND agent_id NOT IN (SELECT value FROM json_each(?))
              ORDER BY RANDOM() LIMIT ?`,
           )
-          .all(this.c.config.mediatorMinBatches, this.c.config.mediatorMinReputation, group.model, sameModel ? 1 : 0,
-            JSON.stringify(exclude), n) as { agent_id: string }[]
+          .all(...cond.params, group.model, sameModel ? 1 : 0, JSON.stringify(exclude), n) as { agent_id: string }[]
       ).map((r) => r.agent_id);
     const same = eligible(true, cp.sameModelRankers, members);
     const rankers = [...same, ...eligible(false, cp.rankers - same.length, [...members, ...same])];
 
+    if (!rankers.length) {
+      this.closeUnranked(groupId);
+      return;
+    }
     tx(this.db, () => {
-      if (!rankers.length) {
-        this.db.prepare(`UPDATE conformity_groups SET status = 'done' WHERE id = ?`).run(groupId);
-        this.db.prepare(`UPDATE controls SET delivery = NULL WHERE group_id = ?`).run(groupId);
-        return;
-      }
       this.db.prepare(`UPDATE conformity_groups SET status = 'ranking', ranking_at = ? WHERE id = ?`).run(now(), groupId);
       for (const r of rankers) {
         const order = [...answers].sort(() => Math.random() - 0.5);
@@ -561,6 +604,33 @@ export class Certifier {
       .all(minutesAgo(this.policy.conformity.rankingTtlMinutes)) as { id: string }[]) {
       this.score(g.id);
     }
+    // A group that did not fill within 7 days is ranked with what it has, or closed unpaid.
+    for (const g of this.db
+      .prepare(`SELECT id FROM conformity_groups WHERE status = 'filling' AND created_at < ?`)
+      .all(minutesAgo(7 * 24 * 60)) as { id: string }[]) {
+      this.maybeStartRanking(g.id, true);
+      const still = this.db.prepare(`SELECT status FROM conformity_groups WHERE id = ?`).get(g.id) as { status: string };
+      if (still.status === "filling") this.closeUnranked(g.id);
+    }
+  }
+
+  /**
+   * No peer could rank the group: its answers are not paid (an unchecked open-ended answer must not
+   * create credits) and nobody is penalized. The bonds were already returned on delivery.
+   */
+  private closeUnranked(groupId: string) {
+    for (const r of this.db
+      .prepare(
+        `SELECT m.id FROM controls k JOIN missions m ON m.id = k.mission_id WHERE k.group_id = ? AND m.status = 'delivered'`,
+      )
+      .all(groupId) as { id: string }[]) {
+      this.db
+        .prepare(`UPDATE missions SET status = 'cancelled', closed_at = ?, outcome_reason = 'not enough peers to rank' WHERE id = ?`)
+        .run(now(), r.id);
+      this.retire(r.id);
+    }
+    this.db.prepare(`UPDATE conformity_groups SET status = 'done' WHERE id = ?`).run(groupId);
+    this.db.prepare(`UPDATE controls SET delivery = NULL WHERE group_id = ?`).run(groupId);
   }
 
   /**
@@ -568,6 +638,7 @@ export class Certifier {
    * always last. A ranker whose best is the consensus worst, or the reverse, is not paid.
    */
   private score(groupId: string) {
+    const outcomes: { missionId: string; controlId: string; pass: boolean }[] = [];
     const rows = this.db
       .prepare(`SELECT ranker_id, labels, ranking FROM rankings WHERE group_id = ? AND ranking IS NOT NULL`)
       .all(groupId) as { ranker_id: string; labels: string; ranking: string }[];
@@ -592,6 +663,13 @@ export class Certifier {
         }
         const best = avg[0].controlId;
         const worst = avg[avg.length - 1].controlId;
+        // An answer every ranker put last (with at least two rankers) is refused; the others are paid.
+        for (const a of avg) {
+          const lastForAll = orders.length >= 2 && orders.every((o) => o.order[o.order.length - 1] === a.controlId);
+          const mission = (this.db.prepare(`SELECT mission_id FROM controls WHERE id = ?`).get(a.controlId) as { mission_id: string })
+            .mission_id;
+          outcomes.push({ missionId: mission, controlId: a.controlId, pass: !lastForAll });
+        }
         for (const o of orders) {
           const right = !(o.order[0] === worst || o.order[o.order.length - 1] === best) || rows.length === 1;
           if (right) {
@@ -605,6 +683,15 @@ export class Certifier {
       this.db.prepare(`UPDATE controls SET delivery = NULL WHERE group_id = ?`).run(groupId); // answers are not kept
       this.db.prepare(`UPDATE rankings SET ranking = '[]' WHERE group_id = ? AND ranking IS NULL`).run(groupId);
     });
+    if (!rows.length) {
+      this.closeUnranked(groupId);
+      return;
+    }
+    for (const o of outcomes) {
+      const k = this.db.prepare(`SELECT * FROM controls WHERE id = ?`).get(o.controlId) as unknown as ControlRow;
+      this.record(k, o.pass);
+      this.market.finalize(o.missionId, o.pass ? "accept" : "refuse", o.pass ? "accepted by the requester" : "ranked last by every peer");
+    }
   }
 
   // ------------------------------------------------------------------ public profile

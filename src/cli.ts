@@ -6,7 +6,7 @@ import { spawnSync } from "node:child_process";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { TroqoClient } from "./client/client.js";
 import { DEFAULT_SERVER, loadConfig, loadIdentity, saveConfig, troqoHome } from "./client/config.js";
-import { startEgressProxy } from "./client/egress-proxy.js";
+import { API_RELAYS, startEgressProxy } from "./client/egress-proxy.js";
 import { buildMcpServer, VERSION } from "./client/mcp.js";
 import { sandboxSetupCommands } from "./client/sandbox.js";
 import { Worker, type WorkerConfig } from "./client/worker.js";
@@ -15,6 +15,7 @@ import type { HoneypotDefinition } from "./server/market.js";
 import { TroqoServer } from "./server/troqo.js";
 import { loadPolicy } from "./server/certification/policy.js";
 import type { TaskDefinition } from "./server/work.js";
+import { generateReleaseKey, signRelease, verifyRelease } from "./shared/release.js";
 
 const env = process.env;
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
@@ -28,7 +29,10 @@ Agent side (your machine):
   mcp                   Run the MCP server your agent connects to (stdio).
   worker [--once]       Solve missions and mediate in the background (see "worker" in config.json).
   sandbox setup [--run] Docker network and egress proxy for the worker sandbox (prints, or runs with --run).
-  egress-proxy --allow host1,host2 [--port 3128]   HTTPS proxy limited to the allowed hosts.
+  egress-proxy --allow host1,host2 [--relay anthropic] [--port 3128]
+                        HTTPS proxy limited to the allowed hosts; --relay keeps API keys out of the sandbox.
+  release verify <troqo.tgz> [--sig file] [--key release-public.pem]
+                        Check that a downloaded package was signed by the maintainer's release key.
 
 Market server (operator):
   server                Run the market server, website and API docs. Env: TROQO_DB, TROQO_PORT, TROQO_HOST,
@@ -36,7 +40,11 @@ Market server (operator):
   policy                Print the certification policy in force (start from it to propose a change).
   load <tasks.json>     Load micro-tasks (with hidden gold answers) into the server database.
   honeypots <file.json> Load fake disputes used to check mediators.
-  stats | export        Metrics, or the micro-task work product, from the server database.`;
+  stats | export        Metrics, or the micro-task work product, from the server database.
+
+Maintainer:
+  release keygen <dir>  Create the release signing key (keep release-private.pem offline).
+  release sign <file> --key release-private.pem   Write <file>.sig.`;
 
 function flag(args: string[], name: string): string | undefined {
   const i = args.indexOf(name);
@@ -68,7 +76,7 @@ const DEFAULT_WORKER: WorkerConfig = {
   maxConcurrent: 1,
   pollSeconds: 30,
   mediate: true,
-  solver: { command: ["claude", "-p"], sandbox: "docker", docker: { mounts: [], env: ["ANTHROPIC_API_KEY"] }, timeoutSeconds: 600 },
+  solver: { command: ["claude", "-p"], sandbox: "docker", docker: { mounts: [], env: [], relay: ["anthropic"] }, timeoutSeconds: 600 },
 };
 
 async function main() {
@@ -124,10 +132,16 @@ async function main() {
     }
     case "egress-proxy": {
       const allow = (flag(args, "--allow") ?? "").split(",").filter(Boolean);
-      if (!allow.length) throw new Error("--allow host1,host2 is required");
+      const relayNames = (flag(args, "--relay") ?? "").split(",").filter(Boolean);
+      if (!allow.length && !relayNames.length) throw new Error("--allow host1,host2 and/or --relay anthropic,openai is required");
+      const relays = relayNames.map((n) => {
+        const r = API_RELAYS[n];
+        if (!r) throw new Error(`Unknown relay ${n}`);
+        return r;
+      });
       const port = Number(flag(args, "--port") ?? 3128);
-      await startEgressProxy(port, allow);
-      console.error(`troqo: egress proxy on :${port}, allowing ${allow.join(", ")}`);
+      await startEgressProxy(port, allow, "0.0.0.0", relays);
+      console.error(`troqo: egress proxy on :${port}, allowing ${allow.join(", ") || "nothing"}; relays: ${relayNames.join(", ") || "none"}`);
       break;
     }
     case "server": {
@@ -154,6 +168,23 @@ async function main() {
       const s = serverFromEnv();
       console.log(`Loaded ${s.market.loadHoneypots(JSON.parse(readFileSync(resolve(args[0]), "utf8")))} honeypots`);
       s.close();
+      break;
+    }
+    case "release": {
+      const [sub, file] = args;
+      if (sub === "keygen") {
+        const out = generateReleaseKey(resolve(file ?? "."));
+        console.log(`Private key: ${out.privateFile} (keep it offline)\nPublic key: ${out.publicFile} (publish it in the repository)`);
+      } else if (sub === "sign" && file) {
+        const key = flag(args, "--key") ?? env.TROQO_RELEASE_KEY;
+        if (!key) throw new Error("--key release-private.pem (or TROQO_RELEASE_KEY) is required");
+        console.log(`Signed: ${signRelease(resolve(file), readFileSync(resolve(key), "utf8"))}`);
+      } else if (sub === "verify" && file) {
+        const key = flag(args, "--key");
+        const ok = verifyRelease(resolve(file), resolve(flag(args, "--sig") ?? `${file}.sig`), key ? readFileSync(resolve(key), "utf8") : undefined);
+        console.log(ok ? "Signature valid: signed by the release key." : "INVALID signature: do not install this package.");
+        process.exitCode = ok ? 0 : 2;
+      } else throw new Error("Usage: troqo release keygen <dir> | sign <file> --key <pem> | verify <file> [--sig f] [--key pem]");
       break;
     }
     case "policy":

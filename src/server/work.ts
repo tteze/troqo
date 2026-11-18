@@ -243,22 +243,9 @@ export class Work {
     return { passed, creditsEarned: earned, creditsBalance: this.c.balance(agentId) };
   }
 
-  /**
-   * Market-wide credit creation over the last 24 hours, and its cap: a base plus a share of the
-   * daily credits paid on accepted missions (averaged over 7 days), so it follows real activity.
-   */
+  /** Market-wide credit budget: see Context.faucet. */
   faucet(): { budget: number; minted: number } {
-    const cfg = this.c.config;
-    const paid = this.c.db
-      .prepare(
-        `SELECT COALESCE(SUM(price_credits), 0) AS c FROM missions
-         WHERE status = 'accepted' AND honeypot_id IS NULL AND control_id IS NULL AND closed_at >= ?`,
-      )
-      .get(minutesAgo(7 * 24 * 60)) as { c: number };
-    const minted = this.c.db
-      .prepare(`SELECT COALESCE(SUM(credits), 0) AS c FROM supply WHERE reason = 'work' AND created_at >= ?`)
-      .get(minutesAgo(24 * 60)) as { c: number };
-    return { budget: Math.floor(cfg.mintBaseCreditsPerDay + (cfg.mintActivityRatio * paid.c) / 7), minted: minted.c };
+    return this.c.faucet();
   }
 
   /** Real tasks whose answers reached consensus: the work product of the faucet. */

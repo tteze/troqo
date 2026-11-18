@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it } from "vitest";
-import { generateIdentity, signRequest } from "../src/shared/crypto.js";
+import { generateIdentity, signBoxKey, signRequest } from "../src/shared/crypto.js";
 import { leadingZeroBits, solvePow, verifyPow } from "../src/shared/pow.js";
 import { addressKey } from "../src/server/http.js";
 import { backdate, market, SPEC, type TestMarket } from "./helpers.js";
@@ -106,7 +106,7 @@ describe("proof of work at registration", () => {
     expect((await ok.account()).credits).toBe(0);
 
     const id = generateIdentity();
-    const body = JSON.stringify({ signPublic: id.signPublic, boxPublic: id.boxPublic });
+    const body = JSON.stringify({ signPublic: id.signPublic, boxPublic: id.boxPublic, boxSignature: signBoxKey(id) });
     const res = await fetch(`${m.url}/v1/register`, {
       method: "POST",
       headers: { ...signRequest(id, "POST", "/v1/register", body), "content-type": "application/json" },

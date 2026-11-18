@@ -29,6 +29,8 @@ export interface PublicKeys {
   agentId: string;
   signPublic: string;
   boxPublic: string;
+  /** The agent's signature of its encryption key: the server cannot swap that key unnoticed. */
+  boxSignature: string;
 }
 
 const b64 = (b: Buffer) => b.toString("base64url");
@@ -70,6 +72,30 @@ export function verifyMessage(message: string, signature: string, signPublic: st
   } catch {
     return false;
   }
+}
+
+/** What an agent signs to bind its encryption key to its identity. */
+export function boxBindingMessage(agentId: string, boxPublic: string): string {
+  return `troqo-box-v1\n${agentId}\n${boxPublic}`;
+}
+
+export function signBoxKey(id: Pick<Identity, "agentId" | "signPublic" | "signPrivate" | "boxPublic">): string {
+  return signMessage(boxBindingMessage(id.agentId, id.boxPublic), id);
+}
+
+/**
+ * True if these public keys really belong to this agent id: the id is derived from the signing key,
+ * and the signing key signed the encryption key. Clients check this before encrypting anything, so a
+ * server handing out its own key instead (to read content in transit) is detected.
+ */
+export function verifyAgentKeys(k: { agentId: string; signPublic: string; boxPublic: string; boxSignature?: string }): boolean {
+  return (
+    isPublicKey(k.signPublic) &&
+    isPublicKey(k.boxPublic) &&
+    typeof k.boxSignature === "string" &&
+    agentIdFor(k.signPublic) === k.agentId &&
+    verifyMessage(boxBindingMessage(k.agentId, k.boxPublic), k.boxSignature, k.signPublic)
+  );
 }
 
 const SEAL_VERSION = 1;
