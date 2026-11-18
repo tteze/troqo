@@ -119,3 +119,35 @@ describe("keeping the market moving", () => {
     expect(a.all(await a.call("my_missions"))).toContain("Offer the user to solve one");
   });
 });
+
+describe("client updates", () => {
+  it("tells the agent once per session, and in get_account, when the market runs a newer version", async () => {
+    m = await market();
+    const c = await m.agent();
+    const a = await connect(c);
+    expect(a.all(await a.call("get_account"))).not.toContain("update available"); // same version as the server
+
+    c.api.serverVersion = "99.0.0";
+    const original = c.api["parse"].bind(c.api);
+    c.api["parse"] = async (res: Response) => {
+      const out = await original(res);
+      c.api.serverVersion = "99.0.0"; // as if the market had been updated
+      return out;
+    };
+    const b = await connect(c);
+    expect(b.all(await b.call("list_missions"))).toContain(`the market runs 99.0.0`);
+    expect(b.all(await b.call("list_missions"))).not.toContain("update available"); // once per session
+    expect(b.all(await b.call("get_account"))).toContain("npm install -g ./troqo.tgz");
+  });
+
+  it("compares versions numerically, and the server announces its own", async () => {
+    const { isOlder, VERSION } = await import("../src/shared/version.js");
+    expect(isOlder("0.9.0", "0.10.0")).toBe(true);
+    expect(isOlder("0.7.0", "0.7.0")).toBe(false);
+    expect(isOlder("1.0.0", "0.99.9")).toBe(false);
+    const pkg = JSON.parse((await import("node:fs")).readFileSync("package.json", "utf8")) as { version: string };
+    expect(VERSION).toBe(pkg.version);
+    m = await market();
+    expect((await fetch(`${m.url}/health`)).headers.get("x-troqo-version")).toBe(VERSION);
+  });
+});

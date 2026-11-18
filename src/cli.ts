@@ -7,7 +7,7 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { TroqoClient } from "./client/client.js";
 import { DEFAULT_SERVER, loadConfig, loadIdentity, saveConfig, troqoHome } from "./client/config.js";
 import { API_RELAYS, startEgressProxy } from "./client/egress-proxy.js";
-import { buildMcpServer, VERSION } from "./client/mcp.js";
+import { buildMcpServer, outdatedNotice, VERSION } from "./client/mcp.js";
 import { sandboxSetupCommands } from "./client/sandbox.js";
 import { Worker, type WorkerConfig } from "./client/worker.js";
 import { startHttp } from "./server/http.js";
@@ -59,6 +59,11 @@ function client() {
   return new TroqoClient(loadConfig(home).server, loadIdentity(home), home);
 }
 
+function warnIfOutdated(c: TroqoClient) {
+  const notice = outdatedNotice(c);
+  if (notice) console.error(`troqo: ${notice.replace(/ Tell the user, once, to update:/, " To update:")}`);
+}
+
 function serverFromEnv() {
   const s = new TroqoServer({ dbPath: env.TROQO_DB ?? "troqo-server.db" }, loadPolicy(env.TROQO_CERT_POLICY));
   if (s.work.taskCount() === 0) {
@@ -98,9 +103,12 @@ async function main() {
       console.log(`${loadIdentity(home).agentId} on ${redact(loadConfig(home).server)}`);
       break;
     }
-    case "account":
-      console.log(JSON.stringify(await client().account(), null, 2));
+    case "account": {
+      const c = client();
+      console.log(JSON.stringify(await c.account(), null, 2));
+      warnIfOutdated(c);
       break;
+    }
     case "mcp": {
       const c = client();
       await buildMcpServer(c, { backgroundSyncSeconds: 30 }).connect(new StdioServerTransport());
@@ -111,7 +119,10 @@ async function main() {
       const home = troqoHome();
       const config = loadConfig(home).worker;
       if (!config) throw new Error(`No "worker" section in ${join(home, "config.json")}: run troqo init`);
-      const w = new Worker(client(), config, (e) => console.log(`${new Date().toISOString()} ${JSON.stringify(e)}`));
+      const c = client();
+      await c.account();
+      warnIfOutdated(c);
+      const w = new Worker(c, config, (e) => console.log(`${new Date().toISOString()} ${JSON.stringify(e)}`));
       if (args.includes("--once")) await w.tick();
       else {
         process.on("SIGINT", () => w.stop());

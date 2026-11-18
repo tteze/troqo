@@ -5,8 +5,9 @@ import { TroqoError } from "../shared/errors.js";
 import type { DeliveryBundle, MissionInfo, WorkBatch } from "../shared/protocol.js";
 import type { MissionDetails, TroqoClient } from "./client.js";
 import { describeDelivery, untrusted } from "./prompts.js";
+import { isOlder, VERSION } from "../shared/version.js";
 
-export const VERSION = "0.6.0";
+export { VERSION };
 
 type Content = CallToolResult["content"][number];
 const text = (s: string): Content => ({ type: "text", text: s });
@@ -64,6 +65,18 @@ function batchText(b: WorkBatch): string {
   ].join("\n");
 }
 
+/** Tells the agent to have the user update when the market runs a newer Troqo than this client. */
+export function outdatedNotice(client: TroqoClient): string | undefined {
+  const latest = client.api.serverVersion;
+  if (!latest || !isOlder(VERSION, latest)) return undefined;
+  return (
+    `Troqo update available: this client is ${VERSION}, the market runs ${latest}. Tell the user, once, to update: ` +
+    `download ${client.api.server}/download/troqo.tgz (with their beta login if the market asks for one), check it ` +
+    "as the README explains, run npm install -g ./troqo.tgz, then restart this MCP server. An old client may miss " +
+    "features or stop working with the market."
+  );
+}
+
 const minutesSince = (iso: string) => Math.max(0, Math.round((Date.now() - new Date(iso).getTime()) / 60_000));
 
 /**
@@ -107,11 +120,19 @@ export function buildMcpServer(client: TroqoClient, opts: { backgroundSyncSecond
 
   const me = client.agentId;
   const sync = () => client.sync().catch(() => undefined);
-  const run = async (fn: () => Promise<Content[] | string>): Promise<CallToolResult> => {
+  let warnedOutdated = false;
+  const run = async (fn: () => Promise<Content[] | string>, opts: { versionNotice?: boolean } = {}): Promise<CallToolResult> => {
     try {
       await sync();
       const out = await fn();
-      return { content: typeof out === "string" ? [text(out)] : out };
+      const content = typeof out === "string" ? [text(out)] : out;
+      // Once per session, and every time in get_account, while the market runs a newer version.
+      const notice = outdatedNotice(client);
+      if (notice && (opts.versionNotice || !warnedOutdated)) {
+        warnedOutdated = true;
+        content.push(text(notice));
+      }
+      return { content };
     } catch (err) {
       return failure(err);
     }
@@ -125,7 +146,7 @@ export function buildMcpServer(client: TroqoClient, opts: { backgroundSyncSecond
   server.registerTool(
     "get_account",
     { title: "My account", description: "Your agent id, credit balance and reputation.", annotations: { readOnlyHint: true } },
-    () => run(async () => JSON.stringify(await client.account(), null, 2)),
+    () => run(async () => JSON.stringify(await client.account(), null, 2), { versionNotice: true }),
   );
 
   server.registerTool(

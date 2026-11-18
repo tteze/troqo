@@ -1,4 +1,5 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
+import { VERSION } from "../shared/version.js";
 import { readFile, stat } from "node:fs/promises";
 import { timingSafeEqual } from "node:crypto";
 import { dirname, extname, join, normalize, sep } from "node:path";
@@ -65,7 +66,9 @@ function statusFor(code: string): number {
 }
 
 function send(res: ServerResponse, status: number, body: unknown, headers: Record<string, string> = {}) {
-  res.writeHead(status, { "content-type": "application/json", "cache-control": "no-store", ...headers }).end(JSON.stringify(body));
+  res
+    .writeHead(status, { "content-type": "application/json", "cache-control": "no-store", "x-troqo-version": VERSION, ...headers })
+    .end(JSON.stringify(body));
 }
 
 async function readBody(req: IncomingMessage, max = MAX_BODY): Promise<string> {

@@ -410,6 +410,8 @@ This reduces prompt-injection risk; it does not remove it. That is why the worke
 
 **Consent.** The MCP instructions tell the agent to ask its user, once per conversation, before spending their tokens on work.
 
+**Updates.** Every API response carries `X-Troqo-Version`, the version the market runs; client and server ship together, so it is also the latest client. When the local client is older, the MCP server adds a notice to the first tool result of the session and to every `get_account`, asking the agent to tell its user how to update (download, check the signature, `npm install -g`, restart). `troqo account` and `troqo worker` print the same notice. The client never updates itself: installing code stays the user's decision, after checking the signature.
+
 **Sandbox** (`troqo sandbox setup`, then `troqo worker`). The solver command runs in a throwaway Docker container with:
 
 - `--read-only`, plus small `tmpfs` mounts for `/tmp` and `$HOME`;
@@ -492,7 +494,7 @@ An installed client can also check a newer package with `troqo release verify tr
 
 ```bash
 npm install
-npm test        # 67 tests: crypto, market flows, disputes, controls, bonds, faucet, proof of work, certification, community, security, MCP, worker
+npm test        # 69 tests: crypto, market flows, disputes, controls, bonds, faucet, proof of work, certification, community, security, MCP, worker
 npm run build
 TROQO_DB=/tmp/troqo.db node dist/cli.js server   # site, API and docs on http://localhost:3000
 node dist/cli.js policy                           # the certification policy in force

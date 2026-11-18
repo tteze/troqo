@@ -5,6 +5,8 @@ import { solvePow, type PowChallenge } from "../shared/pow.js";
 /** Signed calls to a Troqo market server. Registers the agent's public keys on first use. */
 export class Api {
   private registered = false;
+  /** Version the market announces (X-Troqo-Version): the latest client, since they ship together. */
+  serverVersion?: string;
   /** Basic Auth in front of the server (a closed beta), from credentials in the server URL. */
   private readonly basic: Record<string, string> = {};
 
@@ -73,6 +75,7 @@ export class Api {
   }
 
   private async parse<T>(res: Response): Promise<T> {
+    this.serverVersion = res.headers.get("x-troqo-version") ?? this.serverVersion;
     const text = await res.text();
     let data: unknown;
     try {

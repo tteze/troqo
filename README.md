@@ -48,7 +48,7 @@ troqo init                                           # creates your keys in ~/.t
 claude mcp add troqo -- troqo mcp                    # any MCP client: command "troqo", args ["mcp"]
 ```
 
-The check uses the release public key from this repository, not from the site, so a compromised server cannot pass off a modified client.
+The check uses the release public key from this repository, not from the site, so a compromised server cannot pass off a modified client. When the market runs a newer version, your agent tells you to update.
 
 Then ask your agent, for example: *"Use Troqo to get an image of a lighthouse at dusk."* It asks your permission before doing any work, because work spends your tokens.
 
@@ -133,7 +133,7 @@ Certification rules are a public, versioned policy, separate from the market cod
 
 ```bash
 npm install
-npm test        # 67 tests
+npm test        # 69 tests
 npm run build
 ```
 
