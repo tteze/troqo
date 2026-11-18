@@ -5,11 +5,11 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { generateIdentity, signBoxKey, signRequest } from "../src/shared/crypto.js";
 import { generateReleaseKey, signRelease, verifyRelease } from "../src/shared/release.js";
-import { networkKey } from "../src/server/http.js";
-import { runCode } from "../src/server/certification/code-runner.js";
+import { networkKey, startHttp } from "../src/server/http.js";
+import { Api } from "../src/client/api.js";
 import { API_RELAYS, startEgressProxy, type ApiRelay } from "../src/client/egress-proxy.js";
 import { dockerArgs, sandboxSetupCommands } from "../src/client/sandbox.js";
-import { backdate, market, SPEC, type TestMarket } from "./helpers.js";
+import { ADMIN_TOKEN, backdate, market, SPEC, type TestMarket } from "./helpers.js";
 
 let m: TestMarket;
 const servers: Server[] = [];
@@ -146,20 +146,6 @@ describe("mediators", () => {
   });
 });
 
-describe("code certification runs agents' code isolated", () => {
-  it("grades a function, and contains what it should not do", async () => {
-    expect(await runCode("function solve(a, b) { return a + b }", [[1, 2], [3, 4]])).toEqual(["3", "7"]);
-    expect(await runCode("function solve() { return [typeof process, typeof require, typeof fetch, typeof setTimeout].join() }", [[]])).toEqual([
-      '"undefined,undefined,undefined,undefined"',
-    ]);
-    expect(await runCode("function solve() { return this.constructor.constructor('return process')() }", [[]])).toEqual([null]);
-    expect(await runCode("function solve() { return eval('1') }", [[]])).toEqual([null]);
-    expect(await runCode("function solve() { while (true) {} }", [[]])).toEqual([null]);
-    expect(await runCode("function solve() { const a = []; for (;;) a.push(new Array(1e6).fill(1)) }", [[]])).toEqual([null]);
-    expect(await runCode("not even javascript (", [[1]])).toEqual([null]);
-  });
-});
-
 describe("worker sandbox", () => {
   it("keeps the API key in the proxy: the solver only gets a placeholder and the relay URL", () => {
     const args = dockerArgs(["claude", "-p"], { relay: ["anthropic"], env: ["ANTHROPIC_API_KEY", "LANG"] }).join(" ");
@@ -220,5 +206,36 @@ describe("HTTP hardening", () => {
     expect(((await (await fetch(`${m.url}/v1/pow`)).json()) as { bits: number }).bits).toBe(3);
     expect(networkKey("203.0.113.77")).toBe("203.0.113.0/24");
     expect(networkKey("2001:db8:1:2::9")).toBe("2001:db8:1::/48");
+  });
+});
+
+describe("behind a reverse proxy (closed beta)", () => {
+  it("rate-limits by the address the proxy saw, not by what the client wrote in X-Forwarded-For", async () => {
+    m = await market();
+    const server = await startHttp(m.troqo, { port: 0, trustProxy: true, rateLimitPerMinute: 3 });
+    servers.push(server);
+    const url = `http://127.0.0.1:${(server.address() as { port: number }).port}/health`;
+    const hit = (spoofed: string) => fetch(url, { headers: { "x-forwarded-for": `${spoofed}, 203.0.113.7` } }).then((r) => r.status);
+    expect([await hit("1.1.1.1"), await hit("2.2.2.2"), await hit("3.3.3.3")]).toEqual([200, 200, 200]);
+    expect(await hit("4.4.4.4")).toBe(429);
+  });
+
+  it("sends the Basic Auth of the server URL, and takes the admin token in X-Troqo-Admin", async () => {
+    let seen = "";
+    const proxy = createServer((req, res) => {
+      seen = String(req.headers.authorization ?? "");
+      res.writeHead(200, { "content-type": "application/json" }).end("{}");
+    });
+    servers.push(proxy);
+    await new Promise<void>((r) => proxy.listen(0, "127.0.0.1", () => r()));
+    const api = new Api(`http://beta:p%40ss@127.0.0.1:${(proxy.address() as { port: number }).port}/`, generateIdentity());
+    await api.get("/v1/market");
+    expect(seen).toBe(`Basic ${Buffer.from("beta:p@ss").toString("base64")}`);
+    expect(api.server).not.toMatch(/p%40ss|beta/);
+
+    m = await market();
+    const admin = (headers: Record<string, string>) => fetch(`${m.url}/admin/moderation`, { headers }).then((r) => r.status);
+    expect(await admin({ authorization: "Basic YmV0YTpwYXNz", "x-troqo-admin": ADMIN_TOKEN })).toBe(200);
+    expect(await admin({ authorization: "Basic YmV0YTpwYXNz" })).toBe(401);
   });
 });

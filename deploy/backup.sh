@@ -7,8 +7,8 @@
 # keep the matching identity off this server.
 set -eu
 umask 077
-DB=${TROQO_DB:-/var/lib/troqo/troqo-server.db}
-DEST=${BACKUP_DIR:-/var/backups/troqo}
+DB=${TROQO_DB:-/var/www/troqo/data/troqo.db}
+DEST=${BACKUP_DIR:-/var/www/troqo/backups}
 OUT="$DEST/troqo-$(date +%F).db"
 mkdir -p "$DEST"
 chmod 700 "$DEST"

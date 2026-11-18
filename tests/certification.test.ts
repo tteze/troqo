@@ -3,7 +3,8 @@ import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { TroqoClient } from "../src/client/client.js";
-import { extractJson, GENERATORS, sameJson } from "../src/server/certification/generators.js";
+import { BUG_BASES, makeBugTask, PREDICT_TEMPLATES } from "../src/server/certification/code-exams.js";
+import { corruptAnswer, extractJson, GENERATORS, sameJson } from "../src/server/certification/generators.js";
 import { DEFAULT_POLICY, loadPolicy, validatePolicy, type CertificationPolicy } from "../src/server/certification/policy.js";
 import { market, SPEC, type TestMarket } from "./helpers.js";
 
@@ -21,16 +22,8 @@ const policy = (patch: Partial<CertificationPolicy> = {}): CertificationPolicy =
 const expected = (t: TestMarket, missionId: string) =>
   JSON.parse((t.troqo.ctx.db.prepare(`SELECT expected FROM controls WHERE mission_id = ?`).get(missionId) as { expected: string }).expected);
 
-/**
- * A delivery that passes: the JSON answer, or for code tasks a `solve` that looks the hidden tests up
- * (good enough to exercise grading end to end, including the isolated runner).
- */
-const rightAnswer = (exp: unknown): string => {
-  const tests = (exp as { tests?: { args: unknown[]; out: unknown }[] }).tests;
-  if (!tests) return JSON.stringify(exp);
-  return "```js\nfunction solve(...args) {\n  const t = " + JSON.stringify(tests) +
-    ";\n  return t.find((x) => JSON.stringify(x.args) === JSON.stringify(args)).out;\n}\n```";
-};
+/** A delivery that passes: the expected JSON answer. */
+const rightAnswer = (exp: unknown): string => JSON.stringify(exp);
 
 /** A real mission solved and accepted: that is when hidden controls may follow. */
 async function solveRealMission(t: TestMarket, solver: TroqoClient, kind: string) {
@@ -67,9 +60,8 @@ describe("control generators", () => {
         const b = g.generate(d);
         expect(a.spec).not.toBe(b.spec);
         const right = g.answer ? "Here you go:\n```json\n" + g.answer(a.expected) + "\n```" : rightAnswer(a.expected);
-        expect(await g.grade!(a.expected, right)).toBe(true);
-        expect(await g.grade!(a.expected, JSON.stringify({ wrong: true }))).toBe(false);
-        expect(await g.grade!(a.expected, "function solve() { return null; }")).toBe(false);
+        expect(g.grade!(a.expected, right)).toBe(true);
+        expect(g.grade!(a.expected, JSON.stringify({ wrong: true }))).toBe(false);
       }
     }
     expect(extractJson('Sure! {"a": [1, 2]} done')).toEqual({ a: [1, 2] });
@@ -107,24 +99,61 @@ describe("exams", () => {
   });
 });
 
-describe("code grading", () => {
-  it("runs asynchronously: the server keeps answering while agents' code runs", async () => {
+describe("code exams are graded without running agents' code", () => {
+  // The tests run Troqo's own templates to check them; the server never runs any code.
+  const run = (code: string, call: string) => new Function(`${code}\nreturn ${call};`)() as unknown;
+
+  it("predicts exactly what every program template returns", () => {
+    for (const t of PREDICT_TEMPLATES) {
+      for (let i = 0; i < 40; i++) {
+        const { code, result } = t.make();
+        expect(sameJson(run(code, "run()"), result), `${t.id}\n${code}`).toBe(true);
+      }
+    }
+  });
+
+  it("only uses mutations that really break the function", () => {
+    const inputs: Record<string, unknown[][]> = {
+      "sum-multiples": [[[]], [[60, 1]], [[1, 2, 3, 4, 5, 6, 10, 12, 15, 20]], [[7]], [[30, 2, 9, 8]]],
+      "count-long-words": [["", 3], ["a bb ccc dddd", 3], ["hello world", 5], ["one", 4]],
+      palindrome: [[""], ["Abba"], ["A man, a plan, a canal: Panama"], ["abcba"], ["abca"], ["ab"], ["Noon 1"]],
+      "index-of-max": [[[]], [[3]], [[1, 5, 5, 2]], [[1, 2, 9]], [[0, 0]], [[4, 1]]],
+      "binary-search": [[[1, 3, 5, 7, 9], 1], [[1, 3, 5, 7, 9], 4], [[2], 2], [[], 3], [[1, 3, 5, 7, 9], 9], [[10, 20, 30], 25]],
+      dedupe: [[["Ab", "ab", "c"]], [["x", "y", "x"]], [[]], [["A", "a", "B", "b"]]],
+    };
+    for (const base of BUG_BASES) {
+      for (let i = 0; i < 4; i++) {
+        const p = base.params();
+        const correct = base.lines(p).join("\n").replace("NAME", "f");
+        const outputs = (code: string) => inputs[base.id].map((args) => JSON.stringify(run(code, `f(...${JSON.stringify(args)})`)));
+        const good = outputs(correct);
+        for (const mu of base.mutations(p)) {
+          const lines = base.lines(p);
+          lines[mu.line] = mu.text;
+          expect(outputs(lines.join("\n").replace("NAME", "f")), `${base.id} line ${mu.line + 1}`).not.toEqual(good);
+        }
+      }
+    }
+    for (let i = 0; i < 60; i++) {
+      const task = makeBugTask(1 + (i % 2));
+      const lines = task.numbered.split("\n");
+      expect(lines[task.line - 1]).toMatch(new RegExp(`^\\s*${task.line} \\| `));
+      expect(task.numbered).not.toMatch(/\$|NAME/);
+      expect(() => new Function(lines.map((l) => l.replace(/^\s*\d+ \| /, "")).join("\n"))).not.toThrow();
+    }
+  });
+
+  it("certifies code by reading: a wrong line number fails, the right one passes", async () => {
     m = await market();
     const a = await m.agent();
     const exam = await a.takeExam("code");
+    const want = expected(m, exam.missionId) as Record<string, unknown>;
     await a.sync();
-    await a.deliver(exam.missionId, { mime: "text/plain", content: "```js\nfunction solve() { while (true) {} }\n```" });
-    const started = Date.now();
-    expect((await fetch(`${m.url}/health`)).status).toBe(200);
-    expect(Date.now() - started).toBeLessThan(500); // a blocking runner would hold this for 4 s
-    expect((await a.mission(exam.missionId)).status).toBe("delivered"); // still grading
-    await m.troqo.certifier.idle();
+    await a.deliver(exam.missionId, { mime: "text/plain", content: JSON.stringify(corruptAnswer(want)) });
     expect((await a.mission(exam.missionId)).status).toBe("refused");
-
     const next = await a.takeExam("code");
     await a.sync();
     await a.deliver(next.missionId, { mime: "text/plain", content: rightAnswer(expected(m, next.missionId)) });
-    await m.troqo.certifier.idle();
     expect((await a.mission(next.missionId)).status).toBe("accepted");
   });
 });

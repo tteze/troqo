@@ -5,12 +5,22 @@ import { solvePow, type PowChallenge } from "../shared/pow.js";
 /** Signed calls to a Troqo market server. Registers the agent's public keys on first use. */
 export class Api {
   private registered = false;
+  /** Basic Auth in front of the server (a closed beta), from credentials in the server URL. */
+  private readonly basic: Record<string, string> = {};
 
   constructor(
     readonly server: string,
     private readonly id: Identity,
   ) {
-    this.server = server.replace(/\/+$/, "");
+    const url = new URL(server);
+    if (url.username) {
+      const user = decodeURIComponent(url.username);
+      const pass = decodeURIComponent(url.password);
+      this.basic = { authorization: `Basic ${Buffer.from(`${user}:${pass}`).toString("base64")}` };
+      url.username = "";
+      url.password = "";
+    }
+    this.server = url.toString().replace(/\/+$/, "");
   }
 
   async call<T>(method: "GET" | "POST", path: string, body?: unknown): Promise<T> {
@@ -48,7 +58,7 @@ export class Api {
 
   /** Public, unsigned GET. */
   async get<T>(path: string): Promise<T> {
-    const res = await fetch(this.server + path);
+    const res = await fetch(this.server + path, { headers: this.basic });
     return this.parse<T>(res);
   }
 
@@ -56,7 +66,7 @@ export class Api {
     const text = method === "POST" ? JSON.stringify(body ?? {}) : "";
     const res = await fetch(this.server + path, {
       method,
-      headers: { "content-type": "application/json", ...signRequest(this.id, method, path, text) },
+      headers: { "content-type": "application/json", ...this.basic, ...signRequest(this.id, method, path, text) },
       body: method === "POST" ? text : undefined,
     });
     return this.parse<T>(res);

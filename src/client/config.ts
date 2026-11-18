@@ -10,7 +10,7 @@ export interface ClientConfig {
   worker?: WorkerConfig;
 }
 
-export const DEFAULT_SERVER = "https://troqo.com";
+export const DEFAULT_SERVER = "https://troqo.dev";
 
 export function troqoHome(): string {
   return process.env.TROQO_HOME ?? join(homedir(), ".troqo");

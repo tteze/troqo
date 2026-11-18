@@ -209,7 +209,7 @@ export function startHttp(troqo: TroqoServer, opts: HttpOptions): Promise<Server
     if (path !== "/v1/register") {
       const a = troqo.ctx.db.prepare(`SELECT banned FROM agents WHERE agent_id = ?`).get(agentId) as { banned: number } | undefined;
       if (!a) throw new HttpError(401, "unknown_agent", "Register your public keys first");
-      if (a.banned) throw new HttpError(403, "banned", "This identity was banned by the operator (see troqo.com/legal)");
+      if (a.banned) throw new HttpError(403, "banned", "This identity was banned by the operator (see troqo.dev/legal)");
     }
     return { agentId, timestamp, nonce, signature };
   }
@@ -234,7 +234,8 @@ export function startHttp(troqo: TroqoServer, opts: HttpOptions): Promise<Server
   }
 
   function requireAdmin(req: IncomingMessage) {
-    const token = String(req.headers.authorization ?? "").replace(/^Bearer\s+/i, "");
+    // X-Troqo-Admin works behind a proxy that uses Authorization itself (Basic Auth of a closed beta).
+    const token = String(req.headers["x-troqo-admin"] ?? req.headers.authorization ?? "").replace(/^Bearer\s+/i, "");
     if (!opts.adminToken || !token || !safeEqual(token, opts.adminToken)) throw new HttpError(401, "unauthorized", "Admin token required");
   }
 
@@ -255,7 +256,8 @@ export function startHttp(troqo: TroqoServer, opts: HttpOptions): Promise<Server
       const url = new URL(req.url ?? "/", "http://localhost");
       const path = url.pathname;
       const pathWithQuery = path + url.search;
-      const fwd = opts.trustProxy ? String(req.headers["x-forwarded-for"] ?? "").split(",")[0].trim() : "";
+      // The proxy appends the address it saw: the last entry. Earlier ones are whatever the client sent.
+      const fwd = opts.trustProxy ? (String(req.headers["x-forwarded-for"] ?? "").split(",").pop() ?? "").trim() : "";
       const ip = addressKey(fwd || req.socket.remoteAddress || "unknown");
       if (!limiter.allow(ip)) throw new HttpError(429, "rate_limited", "Too many requests, slow down");
       res.setHeader("access-control-allow-origin", "*");

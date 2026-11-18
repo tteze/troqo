@@ -90,7 +90,7 @@ export class Moderation {
       balance >= deposit,
       "insufficient_credits",
       `Reporting locks ${deposit} credit, returned if the text is removed. Your balance is ${balance}. ` +
-        "You can also write to the contact address on troqo.com/legal.",
+        "You can also write to the contact address on troqo.dev/legal.",
     );
     const id = randomUUID();
     tx(this.db, () => {

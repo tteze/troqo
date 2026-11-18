@@ -14,7 +14,6 @@ import { tx } from "../db.js";
 import { check, Context, minutesAgo, now, plusMinutes, SYSTEM_AGENT } from "../context.js";
 import type { Market } from "../market.js";
 import { generatorById, pickGenerator } from "./generators.js";
-import { runnerBusy } from "./code-runner.js";
 import type { CertificationPolicy } from "./policy.js";
 
 /**
@@ -349,16 +348,7 @@ export class Certifier {
     }
   }
 
-  /** Asynchronous gradings in flight (code runs), by mission: one at a time per mission. */
-  private readonly grading = new Map<string, Promise<void>>();
-
-  /** Resolves once every grading in flight is applied. */
-  async idle(): Promise<void> {
-    while (this.grading.size) await Promise.all([...this.grading.values()]);
-  }
-
   private grade(missionId: string) {
-    if (this.grading.has(missionId)) return;
     const k = this.control(missionId);
     // A conformity answer stays "delivered" until ranked: it is read once, then kept for the rankers.
     if (!k || (k.purpose === "conformity" && k.delivery)) return;
@@ -378,7 +368,7 @@ export class Certifier {
         delivery = undefined;
       }
     }
-    // The ciphertext is erased only once the grade is applied, so a restart mid-grading loses nothing.
+    // Read once: the ciphertext is erased as soon as it is graded or kept for ranking.
     const consumed = () => {
       if (msg) this.db.prepare(`UPDATE messages SET envelope = NULL, fetched_at = ? WHERE id = ?`).run(now(), msg.id);
     };
@@ -398,25 +388,8 @@ export class Certifier {
 
     const g = generatorById(k.generator);
     const usable = !!delivery && !!g?.grade && delivery.mime.startsWith("text/");
-    if (usable && g!.runsCode && runnerBusy()) return; // retried on a later sweep
-    const result = usable ? g!.grade!(JSON.parse(k.expected), delivery!.content) : false;
-    if (typeof result === "boolean") {
-      consumed();
-      this.applyGrade(missionId, k, result);
-      return;
-    }
-    // Code runs in a child process: the server keeps serving meanwhile.
-    const job = result
-      .catch(() => false)
-      .then((passed) => {
-        const still = this.db.prepare(`SELECT 1 FROM missions WHERE id = ? AND status = 'delivered'`).get(missionId);
-        if (!still) return;
-        consumed();
-        this.applyGrade(missionId, k, passed);
-      })
-      .catch((err) => console.error(`troqo: grading ${missionId} failed:`, err))
-      .finally(() => this.grading.delete(missionId));
-    this.grading.set(missionId, job);
+    consumed();
+    this.applyGrade(missionId, k, usable ? g!.grade!(JSON.parse(k.expected), delivery!.content) : false);
   }
 
   private applyGrade(missionId: string, k: ControlRow, passed: boolean) {

@@ -18,6 +18,9 @@ import type { TaskDefinition } from "./server/work.js";
 import { generateReleaseKey, signRelease, verifyRelease } from "./shared/release.js";
 
 const env = process.env;
+
+/** A server URL without the password of a closed beta's Basic Auth. */
+const redact = (url: string) => url.replace(/\/\/([^:/@]+):[^@/]*@/, "//$1:***@");
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
 
 const USAGE = `troqo ${VERSION}: a market where AI agents pay each other with work instead of money.
@@ -87,12 +90,12 @@ async function main() {
       const id = loadIdentity(home);
       const current = loadConfig(home);
       saveConfig({ server: flag(args, "--server") ?? current.server, worker: current.worker ?? DEFAULT_WORKER }, home);
-      console.log(`Agent ${id.agentId}\nKeys and settings in ${home} (keep identity.json private).\nMarket: ${loadConfig(home).server}`);
+      console.log(`Agent ${id.agentId}\nKeys and settings in ${home} (keep identity.json private).\nMarket: ${redact(loadConfig(home).server)}`);
       break;
     }
     case "whoami": {
       const home = troqoHome();
-      console.log(`${loadIdentity(home).agentId} on ${loadConfig(home).server}`);
+      console.log(`${loadIdentity(home).agentId} on ${redact(loadConfig(home).server)}`);
       break;
     }
     case "account":

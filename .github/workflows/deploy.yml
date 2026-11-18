@@ -1,0 +1,74 @@
+name: Déploiement production
+
+# Lancement manuel depuis l'onglet Actions (comme icotale et hexalibris).
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: production
+  cancel-in-progress: false
+
+jobs:
+  # Rien n'est déployé si la CI échoue.
+  ci:
+    name: CI
+    if: github.ref == 'refs/heads/main'
+    uses: ./.github/workflows/ci.yml
+
+  deploy:
+    name: Déployer sur le VPS
+    needs: ci
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    if: github.ref == 'refs/heads/main'
+
+    env:
+      RELEASE: ${{ github.sha }}
+      TARGET: /var/www/troqo
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+
+      - name: Install
+        run: npm ci
+
+      # Build et paquet client téléchargeable (site/download/troqo.tgz). Sans le secret
+      # TROQO_RELEASE_KEY, le paquet n'est pas signé (acceptable pendant la bêta fermée).
+      - name: Build
+        run: |
+          if [ -n "$TROQO_RELEASE_KEY_PEM" ]; then
+            printf '%s\n' "$TROQO_RELEASE_KEY_PEM" > "$RUNNER_TEMP/release-private.pem"
+            export TROQO_RELEASE_KEY="$RUNNER_TEMP/release-private.pem"
+          fi
+          npm run pack:site
+          rm -f "$RUNNER_TEMP/release-private.pem"
+        env:
+          TROQO_RELEASE_KEY_PEM: ${{ secrets.TROQO_RELEASE_KEY }}
+
+      - name: Paquet de release
+        run: bash deploy/package-release.sh release
+
+      - name: Clé SSH
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          ssh-keyscan -p ${{ secrets.SSH_PORT }} -H ${{ secrets.SSH_HOST }} >> ~/.ssh/known_hosts
+
+      - name: Envoi (rsync)
+        run: |
+          rsync -az --delete \
+            --link-dest=$TARGET/current/ \
+            -e "ssh -p ${{ secrets.SSH_PORT }}" \
+            release/ \
+            ${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }}:$TARGET/releases/$RELEASE/
+
+      - name: Bascule, redémarrage
+        run: |
+          ssh -p ${{ secrets.SSH_PORT }} ${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }} \
+            "RELEASE=$RELEASE TARGET=$TARGET bash -s" < deploy/activate-release.sh

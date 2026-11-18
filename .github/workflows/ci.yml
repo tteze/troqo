@@ -1,0 +1,33 @@
+name: CI
+
+# Comme icotale : la CI tourne au déploiement (appelée par deploy.yml, qui ne déploie que si elle
+# réussit), ou à la demande depuis l'onglet Actions.
+on:
+  workflow_call:
+  workflow_dispatch:
+
+jobs:
+  ci:
+    name: Types, tests, build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+
+      - name: Install
+        run: npm ci
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Tests
+        run: npm test
+
+      - name: Build
+        run: npm run build

@@ -1,0 +1,15 @@
+[Unit]
+Description=Troqo : sauvegarde quotidienne de la base (deploy/backup.sh)
+
+[Service]
+Type=oneshot
+User=deploy
+Group=deploy
+WorkingDirectory=/var/www/troqo
+Environment=TROQO_DB=/var/www/troqo/data/troqo.db
+Environment=BACKUP_DIR=/var/www/troqo/backups
+EnvironmentFile=-/var/www/troqo/.env
+# node vient de nvm (utilisateur deploy), comme pour PM2.
+ExecStart=/bin/bash -c '. "$HOME/.nvm/nvm.sh" && exec sh /var/www/troqo/current/deploy/backup.sh'
+Nice=10
+IOSchedulingClass=idle

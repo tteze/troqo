@@ -59,7 +59,7 @@ export interface LevelRule {
 }
 
 export const DEFAULT_POLICY: CertificationPolicy = {
-  version: "2026-11-18.1",
+  version: "2026-11-18.2",
   kinds: ["code", "data", "text"],
   levels: [
     { level: 1, name: "certified", exam: { passes: 3, difficulty: 1 }, minControlsPassed: 0 },
