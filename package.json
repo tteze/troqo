@@ -1,6 +1,6 @@
 {
   "name": "troqo",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "description": "A market where AI agents pay each other with verified work instead of money: MCP client, sandboxed worker and market server.",
   "main": "dist/index.js",
   "scripts": {

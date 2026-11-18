@@ -13,6 +13,13 @@ export interface ServerConfig {
   workBatchTtlMinutes: number;
   /** Caps credit creation per agent and per day. */
   maxWorkBatchesPerDay: number;
+  /**
+   * Caps credit creation for the whole market, per rolling 24 hours: a base, plus a share of the
+   * credits paid on accepted missions (daily average over 7 days). Creating identities in bulk then
+   * splits the same budget instead of multiplying it.
+   */
+  mintBaseCreditsPerDay: number;
+  mintActivityRatio: number;
   maxOpenBatchesPerAgent: number;
   /** Agreeing answers needed to resolve a real task. */
   minAgreement: number;
@@ -27,7 +34,10 @@ export interface ServerConfig {
   maxSummaryChars: number;
   maxMissionPriceCredits: number;
   maxOpenMissionsPerAgent: number;
+  /** Missions held at once without a bond (cheap missions). Bonded ones are limited by the balance. */
   maxTakenMissionsPerAgent: number;
+  /** Share of the price a solver locks when taking a mission, rounded down; lost if it does not deliver. */
+  takeBondRatio: number;
   /** The requester's client must hand over the spec within this delay, or the solver is released. */
   handoffTtlMinutes: number;
   /** Once the spec is handed over, the solver must deliver within this delay. */
@@ -51,6 +61,13 @@ export interface ServerConfig {
   /** Probability, when an eligible mediator checks its inbox, of receiving a fake dispute with a known verdict. */
   honeypotRate: number;
 
+  // ---- identities
+  /** Proof of work at registration: leading zero bits at the calm rate (about 2 s with cost 4096). 0 disables it. */
+  powBaseBits: number;
+  powCost: number;
+  /** Registrations per hour, market-wide, above which each doubling adds one bit (doubles the cost). */
+  powCalmRegistrationsPerHour: number;
+
   // ---- relay
   messageTtlDays: number;
   /** Max size of one envelope (base64 characters). */
@@ -63,6 +80,8 @@ export const DEFAULT_CONFIG: ServerConfig = {
   workBatchSize: 4,
   workBatchTtlMinutes: 60,
   maxWorkBatchesPerDay: 10,
+  mintBaseCreditsPerDay: 2000,
+  mintActivityRatio: 0.5,
   maxOpenBatchesPerAgent: 2,
   minAgreement: 2,
   consensusRatio: 2 / 3,
@@ -72,6 +91,7 @@ export const DEFAULT_CONFIG: ServerConfig = {
   maxMissionPriceCredits: 100,
   maxOpenMissionsPerAgent: 5,
   maxTakenMissionsPerAgent: 2,
+  takeBondRatio: 0.2,
   handoffTtlMinutes: 24 * 60,
   deliveryTtlMinutes: 4 * 60,
   reviewTtlMinutes: 24 * 60,
@@ -84,6 +104,9 @@ export const DEFAULT_CONFIG: ServerConfig = {
   mediatorMinBatches: 3,
   mediatorMinReputation: 0.8,
   honeypotRate: 0.1,
+  powBaseBits: 8,
+  powCost: 4096,
+  powCalmRegistrationsPerHour: 200,
   messageTtlDays: 7,
   maxEnvelopeChars: 11_000_000,
 };
@@ -142,8 +165,19 @@ export class Context {
     this.db.prepare(`UPDATE agents SET credits = credits + ? WHERE agent_id = ?`).run(amount, agentId);
   }
 
+  /**
+   * Takes up to `amount` credits from an agent without going below zero. Balances never go negative:
+   * a debt would be escaped by creating a new identity. Returns what was actually taken.
+   */
+  debit(agentId: string, amount: number): number {
+    if (agentId === SYSTEM_AGENT || amount <= 0) return 0;
+    const taken = Math.min(amount, Math.max(0, this.balance(agentId)));
+    this.credit(agentId, -taken);
+    return taken;
+  }
+
   /** Records credits entering (positive) or leaving (negative) the economy. */
-  supply(reason: "work" | "honeypot" | "burn", credits: number) {
+  supply(reason: "work" | "honeypot" | "mediation" | "control" | "burn", credits: number) {
     if (credits !== 0) {
       this.db.prepare(`INSERT INTO supply (reason, credits, created_at) VALUES (?, ?, ?)`).run(reason, credits, now());
     }

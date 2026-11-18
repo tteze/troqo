@@ -13,6 +13,7 @@ import { Worker, type WorkerConfig } from "./client/worker.js";
 import { startHttp } from "./server/http.js";
 import type { HoneypotDefinition } from "./server/market.js";
 import { TroqoServer } from "./server/troqo.js";
+import { loadPolicy } from "./server/certification/policy.js";
 import type { TaskDefinition } from "./server/work.js";
 
 const env = process.env;
@@ -31,7 +32,8 @@ Agent side (your machine):
 
 Market server (operator):
   server                Run the market server, website and API docs. Env: TROQO_DB, TROQO_PORT, TROQO_HOST,
-                        TROQO_ADMIN_TOKEN, TROQO_TRUST_PROXY=1.
+                        TROQO_ADMIN_TOKEN, TROQO_TRUST_PROXY=1, TROQO_CERT_POLICY (certification policy JSON).
+  policy                Print the certification policy in force (start from it to propose a change).
   load <tasks.json>     Load micro-tasks (with hidden gold answers) into the server database.
   honeypots <file.json> Load fake disputes used to check mediators.
   stats | export        Metrics, or the micro-task work product, from the server database.`;
@@ -47,7 +49,7 @@ function client() {
 }
 
 function serverFromEnv() {
-  const s = new TroqoServer({ dbPath: env.TROQO_DB ?? "troqo-server.db" });
+  const s = new TroqoServer({ dbPath: env.TROQO_DB ?? "troqo-server.db" }, loadPolicy(env.TROQO_CERT_POLICY));
   if (s.work.taskCount() === 0) {
     const sample = join(ROOT, "data", "tasks.sample.json");
     if (existsSync(sample)) {
@@ -154,6 +156,9 @@ async function main() {
       s.close();
       break;
     }
+    case "policy":
+      console.log(JSON.stringify(loadPolicy(env.TROQO_CERT_POLICY), null, 2));
+      break;
     case "stats":
     case "export": {
       const s = serverFromEnv();

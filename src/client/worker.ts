@@ -1,7 +1,7 @@
 import type { DeliveryBundle, MissionInfo } from "../shared/protocol.js";
 import { imageCapability, type Capability, type ImageCapabilityConfig } from "./capabilities.js";
 import type { TroqoClient } from "./client.js";
-import { mediationPrompt, parseVerdict, solvePrompt } from "./prompts.js";
+import { mediationPrompt, parseRanking, parseVerdict, rankingPrompt, solvePrompt } from "./prompts.js";
 import { runSolver, type SolverConfig } from "./sandbox.js";
 
 /** How a worker earns credits while its user is away. Stored under "worker" in ~/.troqo/config.json. */
@@ -26,6 +26,7 @@ export type WorkerEvent =
   | { type: "took"; missionId: string; kind: string; price: number }
   | { type: "delivered"; missionId: string }
   | { type: "mediated"; missionId: string; verdict: string }
+  | { type: "ranked"; groupId: string; order: string[] }
   | { type: "error"; message: string };
 
 export class Worker {
@@ -50,7 +51,10 @@ export class Worker {
     const report = await this.client.sync();
     if (report.received || report.specsSent || report.evidenceSent || report.problems.length) this.log({ type: "sync", ...report });
 
-    if (this.config.mediate) await this.settleMediations();
+    if (this.config.mediate) {
+      await this.settleMediations();
+      await this.rankAnswers();
+    }
     const mine = await this.client.myMissions();
     for (const m of mine) {
       if (m.solverId === this.client.agentId && m.status === "in_progress" && m.local.spec && !m.local.delivery) {
@@ -61,8 +65,14 @@ export class Worker {
     const held = mine.filter((m) => m.solverId === this.client.agentId && (m.status === "taken" || m.status === "in_progress"));
     if (held.length >= (this.config.maxConcurrent ?? 1)) return;
     const open = await this.client.listMissions();
+    const levels = open.some((m) => m.minLevel)
+      ? new Map((await this.client.profile()).certifications.map((c) => [c.kind, c.level]))
+      : new Map<string, number>();
     const pick = open.find(
-      (m) => this.handles(m.kind) && m.priceCredits >= (this.config.minPrice?.[m.kind] ?? 0),
+      (m) =>
+        this.handles(m.kind) &&
+        m.priceCredits >= (this.config.minPrice?.[m.kind] ?? 0) &&
+        (m.minLevel ?? 0) <= (levels.get(m.kind) ?? 0),
     );
     if (!pick) return;
     try {
@@ -121,6 +131,21 @@ export class Worker {
       }
       await this.client.mediate(d.missionId, verdict, justification);
       this.log({ type: "mediated", missionId: d.missionId, verdict });
+    }
+  }
+
+  /** Conformity rankings use the same solver as mediations. */
+  private async rankAnswers() {
+    for (const r of await this.client.rankings()) {
+      if (!r.bundle) continue;
+      const out = await runSolver(this.config.solver!, rankingPrompt(r.bundle)).catch((e) => {
+        this.log({ type: "error", message: `Ranking ${r.groupId}: ${(e as Error).message}` });
+        return "";
+      });
+      const parsed = parseRanking(out, r.labels);
+      if (!parsed) continue;
+      await this.client.rank(r.groupId, parsed.order, parsed.justification);
+      this.log({ type: "ranked", groupId: r.groupId, order: parsed.order });
     }
   }
 

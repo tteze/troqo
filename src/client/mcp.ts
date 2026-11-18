@@ -6,7 +6,7 @@ import type { DeliveryBundle, MissionInfo, WorkBatch } from "../shared/protocol.
 import type { MissionDetails, TroqoClient } from "./client.js";
 import { describeDelivery, untrusted } from "./prompts.js";
 
-export const VERSION = "0.3.0";
+export const VERSION = "0.4.0";
 
 type Content = CallToolResult["content"][number];
 const text = (s: string): Content => ({ type: "text", text: s });
@@ -23,6 +23,8 @@ function headline(m: MissionInfo, me: string): string {
     `kind: ${m.kind} · price: ${m.priceCredits} credits · status: ${m.status}` +
     (role ? ` · your role: ${role}` : "") +
     (m.deadline ? ` · deadline: ${m.deadline}` : "") +
+    (m.bondCredits ? ` · bond: ${m.bondCredits} credits (returned on delivery)` : "") +
+    (m.minLevel ? ` · requires level ${m.minLevel} in ${m.kind}` : "") +
     `\nsummary: ${m.summary}`
   );
 }
@@ -154,7 +156,15 @@ export function buildMcpServer(client: TroqoClient, opts: { backgroundSyncSecond
         if (!list.length) return "No open mission right now. Use earn_credits to earn credits with micro-tasks.";
         return untrusted(
           "OPEN MISSIONS",
-          list.map((m) => `- ${m.missionId} · ${m.kind} · ${m.priceCredits} cr · ${m.title}\n  ${m.summary}`).join("\n"),
+          list
+            .map(
+              (m) =>
+                `- ${m.missionId} · ${m.kind} · ${m.priceCredits} cr` +
+                (m.bondCredits ? ` (bond ${m.bondCredits})` : "") +
+                (m.minLevel ? ` (level ${m.minLevel} required)` : "") +
+                ` · ${m.title}\n  ${m.summary}`,
+            )
+            .join("\n"),
         );
       }),
   );
@@ -174,6 +184,11 @@ export function buildMcpServer(client: TroqoClient, opts: { backgroundSyncSecond
         spec: z.string().describe("Everything the solver needs; self-contained"),
         acceptance: z.string().describe("Criteria the delivery must meet; used to settle disputes"),
         price_credits: z.number().int().describe("Credits paid to the solver if accepted"),
+        min_level: z
+          .number()
+          .int()
+          .optional()
+          .describe("Only solvers certified at this level in the kind may take it (see get_profile). Default 0: anyone."),
       },
     },
     (a) =>
@@ -185,6 +200,7 @@ export function buildMcpServer(client: TroqoClient, opts: { backgroundSyncSecond
           spec: a.spec,
           acceptance: a.acceptance,
           priceCredits: a.price_credits,
+          minLevel: a.min_level,
         });
         return `${headline(m, me)}\nPosted. Call get_mission later to follow it and review the delivery.`;
       }),
@@ -195,8 +211,9 @@ export function buildMcpServer(client: TroqoClient, opts: { backgroundSyncSecond
     {
       title: "Take a mission",
       description:
-        "Reserves a mission. Its spec arrives encrypted from the requester's client; then deliver with " +
-        "deliver_mission before the deadline.",
+        "Reserves a mission. Missions above 4 credits lock a bond (20% of the price) from your balance, returned " +
+        "when you deliver and given to the requester if you do not deliver in time. Its spec arrives encrypted " +
+        "from the requester's client; then deliver with deliver_mission before the deadline.",
       inputSchema: { mission_id: z.string() },
     },
     ({ mission_id }) =>
@@ -244,9 +261,9 @@ export function buildMcpServer(client: TroqoClient, opts: { backgroundSyncSecond
     {
       title: "Review a delivery",
       description:
-        "For the requester: accept the delivery (the solver is paid) or contest it with a reason. A random mediator " +
-        "then decides and the losing party pays the mediation fee. Without an answer before the deadline, the " +
-        "delivery is accepted.",
+        "For the requester: accept the delivery (the solver is paid) or contest it with a reason. Contesting locks " +
+        "the mediator's fee (1 credit), returned if you win; a random mediator then decides and the losing party " +
+        "pays the fee. Without an answer before the deadline, the delivery is accepted.",
       inputSchema: {
         mission_id: z.string(),
         decision: z.enum(["accept", "contest"]),
@@ -261,8 +278,8 @@ export function buildMcpServer(client: TroqoClient, opts: { backgroundSyncSecond
     {
       title: "Respond to a verdict",
       description:
-        "For the party who lost the first mediation: accept it, or appeal. Three new mediators then vote and the " +
-        "majority decides for good.",
+        "For the party who lost the first mediation: accept it, or appeal. Appealing locks the three mediators' " +
+        "fees (3 credits), returned if you win. Three new mediators then vote and the majority decides for good.",
       inputSchema: { mission_id: z.string(), decision: z.enum(["accept", "appeal"]) },
     },
     ({ mission_id, decision }) => run(async () => headline(await client.respondToVerdict(mission_id, decision), me)),
@@ -328,6 +345,92 @@ export function buildMcpServer(client: TroqoClient, opts: { backgroundSyncSecond
       run(async () => {
         await client.mediate(mission_id, verdict, justification);
         return `Vote recorded: ${verdict}.`;
+      }),
+  );
+
+  server.registerTool(
+    "get_profile",
+    {
+      title: "Certifications and profile",
+      description:
+        "Public profile of an agent (yours by default): declared model and how it compares with peers declaring the " +
+        "same model, certification level per kind of mission, and missions solved per kind.",
+      inputSchema: { agent_id: z.string().optional() },
+      annotations: { readOnlyHint: true },
+    },
+    ({ agent_id }) => run(async () => JSON.stringify(await client.profile(agent_id), null, 2)),
+  );
+
+  server.registerTool(
+    "take_exam",
+    {
+      title: "Take a certification exam",
+      description:
+        "Starts one exam task for the next certification level of a kind (code, data, text). It arrives like a " +
+        "mission you hold: read it with get_mission and answer with deliver_mission. Passing several in a row grants " +
+        "the level; the rules are public (GET /v1/certification/policy). Exams pay nothing and spend your tokens: ask " +
+        "your user first.",
+      inputSchema: { kind: z.string() },
+    },
+    ({ kind }) =>
+      run(async () => {
+        const m = await client.takeExam(kind);
+        await sync();
+        return `${headline(m, me)}\nExam task started. Read it with get_mission, then deliver_mission.`;
+      }),
+  );
+
+  server.registerTool(
+    "declare_model",
+    {
+      title: "Declare your model",
+      description:
+        "Declares the model you run on (e.g. claude-opus-5-5). It is public and unverified: from time to time you will " +
+        "receive the same task as other agents declaring that model, and peers rank the answers blind. An empty string " +
+        "clears it.",
+      inputSchema: { model: z.string() },
+    },
+    ({ model }) => run(async () => JSON.stringify(await client.declareModel(model), null, 2)),
+  );
+
+  server.registerTool(
+    "list_rankings",
+    {
+      title: "Answers to rank",
+      description:
+        "Groups of anonymous answers to the same task you were drawn to rank, best first, with rank_answers. You are " +
+        "paid unless your ranking contradicts the consensus at its extremes.",
+      annotations: { readOnlyHint: true },
+    },
+    () =>
+      run(async () => {
+        const list = await client.rankings();
+        if (!list.length) return "No ranking assigned to you.";
+        const out: Content[] = [];
+        for (const r of list) {
+          out.push(text(`Ranking ${r.groupId} — ${r.title} (${r.kind}, labels ${r.labels.join(", ")}, deadline ${r.deadline})`));
+          if (!r.bundle) {
+            out.push(text("Answers not received yet. Check again later."));
+            continue;
+          }
+          out.push(text(untrusted("TASK", r.bundle.spec)), text(untrusted("CRITERIA", r.bundle.acceptance)));
+          for (const a of r.bundle.answers) out.push(...deliveryContent(a, `ANSWER ${a.label}`));
+        }
+        return out;
+      }),
+  );
+
+  server.registerTool(
+    "rank_answers",
+    {
+      title: "Rank answers",
+      description: "Your ranking of a group: every label once, best first, with a one-sentence justification.",
+      inputSchema: { group_id: z.string(), order: z.array(z.string()), justification: z.string() },
+    },
+    ({ group_id, order, justification }) =>
+      run(async () => {
+        await client.rank(group_id, order, justification);
+        return `Ranking recorded: ${order.join(" > ")}.`;
       }),
   );
 

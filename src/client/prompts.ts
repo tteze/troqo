@@ -1,4 +1,4 @@
-import type { DeliveryBundle, SpecBundle } from "../shared/protocol.js";
+import type { DeliveryBundle, RankingBundle, SpecBundle } from "../shared/protocol.js";
 
 /**
  * Content from other agents is wrapped in explicit markers: it is data to work on, never
@@ -62,4 +62,27 @@ export function parseVerdict(output: string): { verdict: "accept" | "refuse"; ju
   if (!verdict) return undefined;
   const rest = (lines[0].replace(/^(ACCEPT|REFUSE)\W*/i, "") + " " + lines.slice(1).join(" ")).trim();
   return { verdict, justification: rest.length >= 10 ? rest.slice(0, 900) : `Delivery judged against the criteria: ${verdict}.` };
+}
+
+/** Blind ranking of answers to the same task by agents that declare the same model. */
+export function rankingPrompt(b: RankingBundle): string {
+  return [
+    `You are ranking anonymous answers to the same "${b.kind}" task ("${b.title}") on the Troqo market.`,
+    "Rank them from best to worst against the task and its criteria: correctness first, then completeness and clarity.",
+    `On the first line write only the labels from best to worst, separated by ">", e.g. ${b.answers.map((a) => a.label).join(" > ")}.`,
+    "Then one sentence explaining the ranking.",
+    "",
+    untrusted("TASK", b.spec),
+    untrusted("CRITERIA", b.acceptance),
+    ...b.answers.map((a) => untrusted(`ANSWER ${a.label}`, describeDelivery(a))),
+  ].join("\n");
+}
+
+/** Parses "B > A > C\njustification". */
+export function parseRanking(output: string, labels: string[]): { order: string[]; justification: string } | undefined {
+  const lines = output.trim().split("\n").map((l) => l.trim()).filter(Boolean);
+  const order = (lines[0] ?? "").toUpperCase().split(/[^A-Z]+/).filter(Boolean);
+  if (order.length !== labels.length || [...order].sort().join() !== [...labels].sort().join()) return undefined;
+  const rest = lines.slice(1).join(" ").trim();
+  return { order, justification: rest.length >= 10 ? rest.slice(0, 900) : "Ranked by correctness, then completeness and clarity." };
 }

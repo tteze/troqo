@@ -1,6 +1,6 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import type { DeliveryBundle, SpecBundle } from "../shared/protocol.js";
+import type { DeliveryBundle, RankingBundle, SpecBundle } from "../shared/protocol.js";
 
 /** Work content kept on the agent's machine only: the server never stores it. */
 export interface LocalMission {
@@ -11,6 +11,8 @@ export interface LocalMission {
   deliveryTampered?: boolean;
   /** As a mediator: the pieces received from each party. */
   evidence?: { spec?: SpecBundle; delivery?: DeliveryBundle; specTampered?: boolean; deliveryTampered?: boolean };
+  /** As a ranker (stored under the group id): the anonymous answers to rank. */
+  ranking?: RankingBundle;
 }
 
 export class Store {

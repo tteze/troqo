@@ -11,9 +11,13 @@ function serverDump(t: TestMarket): string {
   return tables.map((n) => JSON.stringify(t.troqo.ctx.db.prepare(`SELECT * FROM ${n}`).all())).join("\n");
 }
 
-async function delivered(t: TestMarket, delivery = "export const slugify = (s: string) => s.toLowerCase().split(' ').join('-');") {
+async function delivered(
+  t: TestMarket,
+  delivery = "export const slugify = (s: string) => s.toLowerCase().split(' ').join('-');",
+  solverCredits = 2, // the bond of a 10-credit mission
+) {
   const req = await t.agent(20);
-  const sol = await t.agent(0);
+  const sol = await t.agent(solverCredits);
   const posted = await req.postMission(SPEC);
   await sol.takeMission(posted.missionId);
   await req.sync(); // hands the encrypted spec over
@@ -43,7 +47,7 @@ describe("a mission between two agents", () => {
     expect(m.troqo.ctx.db.prepare(`SELECT COUNT(*) AS n FROM messages WHERE envelope IS NOT NULL`).get()).toEqual({ n: 0 });
 
     await req.review(id, "accept");
-    expect((await sol.account()).credits).toBe(9); // 10 minus 10% burned
+    expect((await sol.account()).credits).toBe(11); // bond back, plus 10 minus 10% burned
     expect((await req.account()).credits).toBe(10);
     expect(m.troqo.market.stats().credits.burned).toBe(1);
   });
@@ -56,7 +60,7 @@ describe("a mission between two agents", () => {
     const posted = await req.postMission(SPEC);
     expect((await poor.listMissions()).map((x) => x.missionId)).toContain(posted.missionId);
     expect(await req.listMissions()).toHaveLength(0);
-    const sol = await m.agent();
+    const sol = await m.agent(2);
     await sol.takeMission(posted.missionId);
     await expect(poor.mission(posted.missionId)).rejects.toMatchObject({ code: "unknown_mission" });
     await expect(poor.takeMission(posted.missionId)).rejects.toMatchObject({ code: "mission_not_open" });
@@ -66,24 +70,28 @@ describe("a mission between two agents", () => {
     m = await market();
     const req = await m.agent(20);
     const posted = await req.postMission(SPEC);
-    await (await m.agent()).takeMission(posted.missionId);
+    const sol = await m.agent(2);
+    await sol.takeMission(posted.missionId);
+    expect((await sol.account()).credits).toBe(0); // bond locked
     await req.cancelMission(posted.missionId);
     expect((await req.account()).credits).toBe(20);
+    expect((await sol.account()).credits).toBe(2); // bond returned
   });
 
   it("applies deadlines: handoff, delivery and review", async () => {
     m = await market();
     const req = await m.agent(30);
-    const sol = await m.agent();
+    const sol = await m.agent(2);
     const a = await req.postMission(SPEC);
     await sol.takeMission(a.missionId);
     backdate(m, `UPDATE missions SET taken_at = ? WHERE id = ?`, a.missionId);
     expect((await sol.listMissions()).map((x) => x.missionId)).toContain(a.missionId);
+    expect((await sol.account()).credits).toBe(2); // spec never came: not the solver's fault, bond returned
 
     const { req: r2, sol: s2, id } = await delivered(m);
     backdate(m, `UPDATE missions SET delivered_at = ? WHERE id = ?`, id);
     expect((await r2.mission(id)).status).toBe("accepted");
-    expect((await s2.account()).credits).toBe(9);
+    expect((await s2.account()).credits).toBe(11);
   });
 });
 
@@ -91,7 +99,7 @@ describe("disputes", () => {
   it("first mediation, appeal to three, majority wins and the minority is not paid", async () => {
     m = await market();
     const mediators = await Promise.all([1, 2, 3, 4].map(() => m.agent(0, { mediator: true })));
-    const { req, sol, id } = await delivered(m);
+    const { req, sol, id } = await delivered(m, undefined, 3); // 3 credits: enough to appeal
     await req.review(id, "contest", "It does not collapse repeated spaces.");
     await req.sync();
     await sol.sync(); // both parties send their pieces to the drawn mediator
@@ -121,12 +129,12 @@ describe("disputes", () => {
     await panel[2].mediate(id, "accept", "The acceptance example passes as written.");
 
     expect((await req.mission(id)).status).toBe("accepted");
-    expect((await sol.account()).credits).toBe(9);
+    expect((await sol.account()).credits).toBe(12); // 3 appeal fees back, plus 9
     expect((await panel[0].account()).credits).toBe(1);
     expect((await panel[2].account()).credits).toBe(1);
     expect((await panel[1].account()).credits).toBe(0);
     expect((await first.x.account()).credits).toBe(0);
-    expect((await req.account()).credits).toBe(8); // 20 - 10 escrow - 2 fees
+    expect((await req.account()).credits).toBe(8); // 20 - 10 escrow - 2 fees (1 from the contest deposit)
   });
 
   it("flags a piece that does not match its fingerprint", async () => {
@@ -152,8 +160,8 @@ describe("disputes", () => {
     backdate(m, `UPDATE mediations SET assigned_at = ? WHERE mission_id = ?`, id);
     const view = await req.mission(id);
     expect(view.status).toBe("refused");
-    expect((await req.account()).credits).toBe(20);
-    expect((await sol.account()).credits).toBe(0);
+    expect((await req.account()).credits).toBe(20); // price and contest deposit refunded
+    expect((await sol.account()).credits).toBe(2); // only its bond, returned on delivery
   });
 });
 

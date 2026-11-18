@@ -55,6 +55,8 @@ class HttpError extends Error {
 function statusFor(code: string): number {
   if (code === "forbidden") return 403;
   if (code.startsWith("unknown_")) return 404;
+  if (code === "faucet_dry") return 429;
+  if (code === "certification_required") return 403;
   if (code === "mission_not_open" || code === "key_conflict" || code === "invalid_state" || code === "batch_closed") return 409;
   return 400;
 }
@@ -124,7 +126,9 @@ export function startHttp(troqo: TroqoServer, opts: HttpOptions): Promise<Server
         summary: str(body.summary),
         priceCredits: Number(body.priceCredits),
         specHash: str(body.specHash),
+        minLevel: body.minLevel === undefined ? undefined : Number(body.minLevel),
       })],
+    ["GET", /^\/v1\/missions\/available$/, ({ agentId, query }) => market.listOpen(query.get("kind") ?? undefined, agentId)],
     ["GET", /^\/v1\/missions\/mine$/, ({ agentId }) => market.mine(agentId)],
     ["GET", /^\/v1\/missions\/([\w-]+)$/, ({ agentId, params }) => market.get(agentId, params[0])],
     ["POST", /^\/v1\/missions\/([\w-]+)\/take$/, ({ agentId, params }) => market.take(agentId, params[0])],
@@ -145,6 +149,10 @@ export function startHttp(troqo: TroqoServer, opts: HttpOptions): Promise<Server
     ["POST", /^\/v1\/missions\/([\w-]+)\/mediate$/, ({ agentId, params, body }) =>
       market.mediate(agentId, params[0], oneOf(body.verdict, ["accept", "refuse"]), str(body.justification))],
     ["GET", /^\/v1\/inbox$/, ({ agentId }) => market.inbox(agentId)],
+    ["POST", /^\/v1\/profile$/, ({ agentId, body }) => troqo.certifier.setModel(agentId, str(body.model))],
+    ["POST", /^\/v1\/certifications\/([\w-]+)\/exam$/, ({ agentId, params }) => troqo.certifier.startExam(agentId, params[0])],
+    ["POST", /^\/v1\/rankings\/([\w-]+)$/, ({ agentId, params, body }) =>
+      troqo.certifier.rank(agentId, params[0], Array.isArray(body.order) ? body.order.map(String) : [], str(body.justification))],
     ["POST", /^\/v1\/inbox\/([\w-]+)\/ack$/, ({ agentId, params }) => (market.ack(agentId, params[0]), { ok: true })],
   ];
 
@@ -199,7 +207,7 @@ export function startHttp(troqo: TroqoServer, opts: HttpOptions): Promise<Server
       const path = url.pathname;
       const pathWithQuery = path + url.search;
       const fwd = opts.trustProxy ? String(req.headers["x-forwarded-for"] ?? "").split(",")[0].trim() : "";
-      const ip = fwd || req.socket.remoteAddress || "unknown";
+      const ip = addressKey(fwd || req.socket.remoteAddress || "unknown");
       if (!limiter.allow(ip)) throw new HttpError(429, "rate_limited", "Too many requests, slow down");
       res.setHeader("access-control-allow-origin", "*");
       if (req.method === "OPTIONS") {
@@ -213,10 +221,12 @@ export function startHttp(troqo: TroqoServer, opts: HttpOptions): Promise<Server
       // ---- public
       if (req.method === "GET") {
         if (path === "/health") return send(res, 200, { ok: true });
+        if (path === "/v1/pow") return send(res, 200, troqo.powChallenge());
+        if (path === "/v1/certification/policy") return send(res, 200, troqo.certifier.policy, { "cache-control": "public, max-age=300" });
         if (path === "/v1/market") return send(res, 200, troqo.publicMarket(), { "cache-control": "public, max-age=15" });
         if (path === "/v1/missions/open") return send(res, 200, market.listOpen(url.searchParams.get("kind") ?? undefined));
         const keys = path.match(/^\/v1\/agents\/([\w-]+)$/);
-        if (keys) return send(res, 200, troqo.publicKeys(keys[1]));
+        if (keys) return send(res, 200, troqo.publicProfile(keys[1]));
         if (path === "/api.md" || path === "/llms.txt") {
           if (await serveFile(res, docsFile)) return;
         }
@@ -233,7 +243,7 @@ export function startHttp(troqo: TroqoServer, opts: HttpOptions): Promise<Server
         const agentId = authenticate(req, pathWithQuery, body);
         if (!registrations.allow(ip)) throw new HttpError(429, "rate_limited", "Too many new identities from this address");
         const b = JSON.parse(body);
-        const out = troqo.register(String(b.signPublic), String(b.boxPublic));
+        const out = troqo.register(String(b.signPublic), String(b.boxPublic), b.pow === undefined ? "" : String(b.pow));
         if (out.agentId !== agentId) throw new HttpError(401, "unauthorized", "Agent id does not match the key");
         return send(res, out.created ? 201 : 200, out);
       }
@@ -272,6 +282,21 @@ export function startHttp(troqo: TroqoServer, opts: HttpOptions): Promise<Server
   });
 
   return new Promise((resolve) => server.listen(opts.port, opts.host ?? "127.0.0.1", () => resolve(server)));
+}
+
+/**
+ * The key rate limits count against. An IPv6 connection usually owns a whole /64 (billions of
+ * addresses), so IPv6 is limited per /64 prefix; IPv4 and IPv4-mapped addresses per address.
+ */
+export function addressKey(ip: string): string {
+  const mapped = ip.match(/^::ffff:(\d+\.\d+\.\d+\.\d+)$/i);
+  if (mapped) return mapped[1];
+  if (!ip.includes(":")) return ip;
+  const [head, tail = ""] = ip.split("%")[0].toLowerCase().split("::");
+  const left = head ? head.split(":") : [];
+  const right = ip.includes("::") && tail ? tail.split(":") : [];
+  const groups = ip.includes("::") ? [...left, ...Array(8 - left.length - right.length).fill("0"), ...right] : left;
+  return groups.slice(0, 4).map((g) => g.replace(/^0+(?=.)/, "")).join(":") + "::/64";
 }
 
 function str(v: unknown): string {

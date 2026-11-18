@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { tx } from "./db.js";
 import { check, Context, minutesAgo, now, plusMinutes, SYSTEM_AGENT } from "./context.js";
+import type { Certifier } from "./certification/certifier.js";
 import { seal, sha256 } from "../shared/crypto.js";
 import { TroqoError } from "../shared/errors.js";
 import {
@@ -48,6 +49,12 @@ interface MissionRow {
   verdict_at: string | null;
   outcome_reason: string | null;
   honeypot_id: string | null;
+  min_level: number;
+  target_id: string | null;
+  control_id: string | null;
+  solver_bond: number;
+  requester_deposit: number;
+  solver_deposit: number;
   created_at: string;
   closed_at: string | null;
 }
@@ -71,9 +78,14 @@ export interface PostMissionInput {
   summary: string;
   priceCredits: number;
   specHash: string;
+  /** Certification level in this kind a solver needs to take the mission. */
+  minLevel?: number;
 }
 
 export class Market {
+  /** Set by TroqoServer. Certification rules live in their own module and policy. */
+  certifier?: Certifier;
+
   constructor(private readonly c: Context) {}
 
   private get db() {
@@ -103,6 +115,12 @@ export class Market {
       "invalid_mission",
       `price: whole credits from 1 to ${this.cfg.maxMissionPriceCredits}`,
     );
+    const minLevel = input.minLevel ?? 0;
+    if (minLevel > 0) {
+      const cert = this.certifier;
+      check(cert && cert.policy.kinds.includes(kind), "invalid_mission", `minLevel: only for certifiable kinds (${cert?.policy.kinds.join(", ")})`);
+      check(Number.isInteger(minLevel) && minLevel <= cert.maxLevel(), "invalid_mission", `minLevel: 0 to ${cert.maxLevel()}`);
+    }
     const open = this.db
       .prepare(`SELECT COUNT(*) AS n FROM missions WHERE requester_id = ? AND status IN (${ACTIVE.map(() => "?").join(",")})`)
       .get(agentId, ...ACTIVE) as { n: number };
@@ -119,10 +137,10 @@ export class Market {
       this.c.credit(agentId, -price);
       this.db
         .prepare(
-          `INSERT INTO missions (id, requester_id, kind, title, summary, price_credits, spec_hash, status, created_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, 'open', ?)`,
+          `INSERT INTO missions (id, requester_id, kind, title, summary, price_credits, spec_hash, status, min_level, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, 'open', ?, ?)`,
         )
-        .run(id, agentId, kind, input.title.trim(), input.summary.trim(), price, input.specHash, now());
+        .run(id, agentId, kind, input.title.trim(), input.summary.trim(), price, input.specHash, minLevel, now());
     });
     return this.get(agentId, id);
   }
@@ -133,11 +151,13 @@ export class Market {
     const m = this.row(missionId);
     check(m.requester_id === agentId, "forbidden", "Only the requester can cancel a mission");
     tx(this.db, () => {
+      const cur = this.row(missionId);
       const res = this.db
-        .prepare(`UPDATE missions SET status = 'cancelled', closed_at = ? WHERE id = ? AND status IN ('open', 'taken')`)
+        .prepare(`UPDATE missions SET status = 'cancelled', closed_at = ?, solver_bond = 0 WHERE id = ? AND status IN ('open', 'taken')`)
         .run(now(), missionId);
-      check(res.changes === 1, "invalid_state", `Mission is ${m.status}; it can only be cancelled before the spec is handed over`);
-      this.c.credit(agentId, m.price_credits);
+      check(res.changes === 1, "invalid_state", `Mission is ${cur.status}; it can only be cancelled before the spec is handed over`);
+      this.c.credit(agentId, cur.price_credits);
+      if (cur.solver_id) this.c.credit(cur.solver_id, cur.solver_bond);
     });
     return this.get(agentId, missionId);
   }
@@ -167,11 +187,19 @@ export class Market {
       this.finalize(missionId, "accept", "accepted by the requester");
     } else {
       check(reason && reason.trim().length >= 10, "invalid_review", "Explain in a sentence which criterion is not met");
-      const res = this.db
-        .prepare(`UPDATE missions SET status = 'disputed', contest_reason = ? WHERE id = ? AND status = 'delivered'`)
-        .run(reason.trim().slice(0, 1000), missionId);
-      check(res.changes === 1, "invalid_state", "Mission was already reviewed");
-      this.draw(missionId, 1, 1);
+      const fee = this.cfg.mediationFeeCredits;
+      this.requireDeposit(agentId, fee, "Contesting");
+      tx(this.db, () => {
+        const res = this.db
+          .prepare(
+            `UPDATE missions SET status = 'disputed', contest_reason = ?, requester_deposit = requester_deposit + ?
+             WHERE id = ? AND status = 'delivered'`,
+          )
+          .run(reason.trim().slice(0, 1000), fee, missionId);
+        check(res.changes === 1, "invalid_state", "Mission was already reviewed");
+        this.c.credit(agentId, -fee);
+        this.draw(missionId, 1, 1);
+      });
     }
     return this.get(agentId, missionId);
   }
@@ -186,41 +214,79 @@ export class Market {
     if (decision === "accept") {
       this.finalize(missionId, m.verdict, "first verdict accepted");
     } else {
-      const res = this.db.prepare(`UPDATE missions SET status = 'appealed' WHERE id = ? AND status = 'mediated'`).run(missionId);
-      check(res.changes === 1, "invalid_state", "Verdict was already answered");
-      this.draw(missionId, 2, this.cfg.appealMediators);
+      const fee = this.cfg.mediationFeeCredits * this.cfg.appealMediators;
+      this.requireDeposit(agentId, fee, "Appealing");
+      const col = agentId === m.requester_id ? "requester_deposit" : "solver_deposit";
+      tx(this.db, () => {
+        const res = this.db
+          .prepare(`UPDATE missions SET status = 'appealed', ${col} = ${col} + ? WHERE id = ? AND status = 'mediated'`)
+          .run(fee, missionId);
+        check(res.changes === 1, "invalid_state", "Verdict was already answered");
+        this.c.credit(agentId, -fee);
+        this.draw(missionId, 2, this.cfg.appealMediators);
+      });
     }
     return this.get(agentId, missionId);
   }
 
   // ------------------------------------------------------------------ solver
 
-  /** Public listing: open missions, best paid first. Visible without an identity. */
-  listOpen(kind?: string, excludeAgent?: string, limit = 50): MissionInfo[] {
+  /**
+   * Open missions, best paid first. Without an agent: the public listing. With one: what that agent
+   * may take, which also includes the controls addressed to it (they look like any other mission).
+   */
+  listOpen(kind?: string, forAgent?: string, limit = 50): MissionInfo[] {
     this.sweep();
     const rows = this.db
       .prepare(
         `SELECT * FROM missions WHERE status = 'open' AND honeypot_id IS NULL AND requester_id != ?
-           AND (? IS NULL OR kind = ?)
+           AND (target_id IS NULL OR target_id = ?) AND (? IS NULL OR kind = ?)
          ORDER BY price_credits DESC, created_at LIMIT ?`,
       )
-      .all(excludeAgent ?? "", kind ?? null, kind ?? null, limit) as unknown as MissionRow[];
+      .all(forAgent ?? "", forAgent ?? "", kind ?? null, kind ?? null, limit) as unknown as MissionRow[];
     return rows.map((r) => this.info(r));
   }
 
   take(agentId: string, missionId: string): MissionInfo {
     this.sweep();
     const m = this.row(missionId);
-    check(!m.honeypot_id, "unknown_mission", `Unknown mission ${missionId}`);
+    check(!m.honeypot_id && (!m.target_id || m.target_id === agentId), "unknown_mission", `Unknown mission ${missionId}`);
     check(m.requester_id !== agentId, "forbidden", "You cannot take your own mission");
-    const held = this.db
-      .prepare(`SELECT COUNT(*) AS n FROM missions WHERE solver_id = ? AND status IN ('taken', 'in_progress')`)
-      .get(agentId) as { n: number };
-    check(held.n < this.cfg.maxTakenMissionsPerAgent, "too_many_taken_missions", "Deliver the missions you hold first");
-    const res = this.db
-      .prepare(`UPDATE missions SET status = 'taken', solver_id = ?, taken_at = ? WHERE id = ? AND status = 'open'`)
-      .run(agentId, now(), missionId);
-    check(res.changes === 1, "mission_not_open", "This mission was taken by someone else or is closed");
+    if (m.min_level > 0) {
+      const level = this.certifier?.level(agentId, m.kind) ?? 0;
+      check(
+        level >= m.min_level,
+        "certification_required",
+        `This mission needs level ${m.min_level} in ${m.kind} (yours: ${level}). Take the exam with take_exam.`,
+      );
+    }
+    const bond = this.bondFor(m.price_credits);
+    if (bond === 0) {
+      const held = this.db
+        .prepare(`SELECT COUNT(*) AS n FROM missions WHERE solver_id = ? AND status IN ('taken', 'in_progress') AND solver_bond = 0`)
+        .get(agentId) as { n: number };
+      check(
+        held.n < this.cfg.maxTakenMissionsPerAgent,
+        "too_many_taken_missions",
+        "Deliver the missions you hold first, or take a better-paid one with a bond",
+      );
+    } else {
+      const balance = this.c.balance(agentId);
+      check(
+        balance >= bond,
+        "insufficient_credits",
+        `Taking this mission locks a ${bond}-credit bond, returned when you deliver and lost if you do not. ` +
+          `Your balance is ${balance}. Earn credits with micro-tasks or take a mission of ${this.maxFreePrice()} credits or less.`,
+      );
+    }
+    tx(this.db, () => {
+      const res = this.db
+        .prepare(`UPDATE missions SET status = 'taken', solver_id = ?, taken_at = ?, solver_bond = ? WHERE id = ? AND status = 'open'`)
+        .run(agentId, now(), bond, missionId);
+      check(res.changes === 1, "mission_not_open", "This mission was taken by someone else or is closed");
+      this.c.credit(agentId, -bond);
+    });
+    if (!m.control_id) this.certifier?.afterTake(agentId, m.kind);
     return this.get(agentId, missionId);
   }
 
@@ -234,11 +300,12 @@ export class Market {
     tx(this.db, () => {
       const res = this.db
         .prepare(
-          `UPDATE missions SET status = 'delivered', delivery_hash = ?, delivery_mime = ?, delivered_at = ?
+          `UPDATE missions SET status = 'delivered', delivery_hash = ?, delivery_mime = ?, delivered_at = ?, solver_bond = 0
            WHERE id = ? AND solver_id = ? AND status = 'in_progress'`,
         )
         .run(input.deliveryHash, input.deliveryMime, now(), missionId, agentId);
       check(res.changes === 1, "invalid_state", `Mission is ${m.status}; deliver once you have the spec`);
+      this.c.credit(agentId, m.solver_bond); // the bond comes back with the delivery
       this.message(missionId, "delivery", agentId, m.requester_id, input.envelope);
     });
     return this.get(agentId, missionId);
@@ -275,6 +342,7 @@ export class Market {
     check(res.changes === 1, "forbidden", "You have no pending mediation for this mission");
     const m = this.row(missionId);
     if (m.honeypot_id) this.closeHoneypot(m, agentId, verdict);
+    else if (m.control_id && this.certifier) this.certifier.onControlVote(missionId, agentId, verdict);
     else this.advance(missionId);
     return { missionId, verdict };
   }
@@ -297,7 +365,7 @@ export class Market {
         missionId: r.mission_id,
         kind: r.kind,
         // Mediators are not told who the parties are.
-        fromId: r.kind.startsWith("evidence-") ? "" : r.from_id,
+        fromId: r.kind.startsWith("evidence-") || r.kind === "ranking" ? "" : r.from_id,
         envelope: r.envelope,
         createdAt: r.created_at,
       }),
@@ -327,7 +395,7 @@ export class Market {
         .get(o.id, `evidence-${piece}`, agentId, o.mediator_id);
       if (!sent) tasks.push({ type: "send_evidence", missionId: o.id, piece, toId: o.mediator_id, toBoxPublic: o.box_public });
     }
-    return { messages, tasks, mediations: this.pendingMediations(agentId) };
+    return { messages, tasks, mediations: this.pendingMediations(agentId), rankings: this.certifier?.pendingRankings(agentId) ?? [] };
   }
 
   /** Erases a fetched message's ciphertext. The row stays as proof that it was sent. */
@@ -367,7 +435,8 @@ export class Market {
     const m = this.row(missionId);
     const party = m.requester_id === agentId || m.solver_id === agentId;
     const mediator = !!this.db.prepare(`SELECT 1 FROM mediations WHERE mission_id = ? AND mediator_id = ?`).get(missionId, agentId);
-    check(party || mediator || (m.status === "open" && !m.honeypot_id), "unknown_mission", `Unknown mission ${missionId}`);
+    const listed = m.status === "open" && !m.honeypot_id && (!m.target_id || m.target_id === agentId);
+    check(party || mediator || listed, "unknown_mission", `Unknown mission ${missionId}`);
     return this.info(m, party || mediator);
   }
 
@@ -390,13 +459,32 @@ export class Market {
            AVG(CASE WHEN status = 'accepted' AND closed_at >= ? THEN price_credits END) AS avgAcceptedPrice,
            MIN(CASE WHEN status = 'open' THEN price_credits END) AS minOpenPrice,
            MAX(CASE WHEN status = 'open' THEN price_credits END) AS maxOpenPrice
-         FROM missions WHERE honeypot_id IS NULL GROUP BY kind ORDER BY open DESC, accepted30d DESC, kind`,
+         FROM missions WHERE honeypot_id IS NULL AND control_id IS NULL GROUP BY kind ORDER BY open DESC, accepted30d DESC, kind`,
       )
       .all(since, since) as unknown as MarketRate[];
-    return rows.map((r) => ({
-      ...r,
-      avgAcceptedPrice: r.avgAcceptedPrice === null ? null : Math.round(r.avgAcceptedPrice * 10) / 10,
-    }));
+    // The going price averages pairs of agents, not missions: trading with yourself between a few
+    // identities moves it no more than one honest pair does.
+    const byPair = new Map(
+      (
+        this.db
+          .prepare(
+            `SELECT kind, AVG(p) AS avg, COUNT(*) AS pairs FROM (
+               SELECT kind, AVG(price_credits) AS p FROM missions
+               WHERE status = 'accepted' AND honeypot_id IS NULL AND control_id IS NULL AND closed_at >= ?
+               GROUP BY kind, requester_id, solver_id)
+             GROUP BY kind`,
+          )
+          .all(since) as { kind: string; avg: number; pairs: number }[]
+      ).map((r) => [r.kind, r]),
+    );
+    return rows.map((r) => {
+      const p = byPair.get(r.kind);
+      return {
+        ...r,
+        avgAcceptedPrice: p ? Math.round(p.avg * 10) / 10 : null,
+        pairs30d: p?.pairs ?? 0,
+      };
+    });
   }
 
   /** Daily history of accepted missions per kind, for the public market page. */
@@ -404,7 +492,7 @@ export class Market {
     return this.db
       .prepare(
         `SELECT substr(closed_at, 1, 10) AS day, kind, COUNT(*) AS accepted, ROUND(AVG(price_credits), 1) AS avgPrice
-         FROM missions WHERE status = 'accepted' AND honeypot_id IS NULL AND closed_at >= ?
+         FROM missions WHERE status = 'accepted' AND honeypot_id IS NULL AND control_id IS NULL AND closed_at >= ?
          GROUP BY day, kind ORDER BY day`,
       )
       .all(minutesAgo(days * 24 * 60)) as { day: string; kind: string; accepted: number; avgPrice: number }[];
@@ -412,10 +500,10 @@ export class Market {
 
   stats() {
     const byStatus = this.db
-      .prepare(`SELECT status, COUNT(*) AS n FROM missions WHERE honeypot_id IS NULL GROUP BY status`)
+      .prepare(`SELECT status, COUNT(*) AS n FROM missions WHERE honeypot_id IS NULL AND control_id IS NULL GROUP BY status`)
       .all() as { status: string; n: number }[];
     const disputes = this.db
-      .prepare(`SELECT COUNT(DISTINCT d.mission_id) AS n FROM mediations d JOIN missions m ON m.id = d.mission_id WHERE m.honeypot_id IS NULL`)
+      .prepare(`SELECT COUNT(DISTINCT d.mission_id) AS n FROM mediations d JOIN missions m ON m.id = d.mission_id WHERE m.honeypot_id IS NULL AND m.control_id IS NULL`)
       .get() as { n: number };
     const honeypots = this.db
       .prepare(
@@ -428,13 +516,13 @@ export class Market {
       reason: string;
       c: number;
     }[];
-    const circulating = this.db.prepare(`SELECT COALESCE(SUM(credits), 0) AS c FROM agents`).get() as { c: number };
+    const circulating = this.db.prepare(`SELECT COALESCE(SUM(credits), 0) AS c FROM agents WHERE system = 0`).get() as { c: number };
     const escrow = this.db
       .prepare(
-        `SELECT COALESCE(SUM(price_credits), 0) AS c FROM missions WHERE honeypot_id IS NULL AND status IN (${ACTIVE.map(() => "?").join(",")})`,
+        `SELECT COALESCE(SUM(price_credits), 0) AS c FROM missions WHERE honeypot_id IS NULL AND control_id IS NULL AND status IN (${ACTIVE.map(() => "?").join(",")})`,
       )
       .get(...ACTIVE) as { c: number };
-    const agents = this.db.prepare(`SELECT COUNT(*) AS n FROM agents`).get() as { n: number };
+    const agents = this.db.prepare(`SELECT COUNT(*) AS n FROM agents WHERE system = 0`).get() as { n: number };
     return {
       agents: agents.n,
       missions: Object.fromEntries(byStatus.map((r) => [r.status, r.n])),
@@ -544,7 +632,7 @@ export class Market {
 
   // ------------------------------------------------------------------ internals
 
-  private row(missionId: string): MissionRow {
+  row(missionId: string): MissionRow {
     const m = this.db.prepare(`SELECT * FROM missions WHERE id = ?`).get(missionId) as MissionRow | undefined;
     if (!m) throw new TroqoError("unknown_mission", `Unknown mission ${missionId}`);
     return m;
@@ -563,6 +651,9 @@ export class Market {
       specHash: m.spec_hash,
       createdAt: m.created_at,
     };
+    if (m.min_level > 0) info.minLevel = m.min_level;
+    if (m.status === "open") info.bondCredits = this.bondFor(m.price_credits);
+    else if (m.solver_bond > 0 && involved) info.bondCredits = m.solver_bond;
     if (involved) {
       if (m.solver_id && !honeypot) info.solverId = m.solver_id;
       if (m.delivery_hash) info.deliveryHash = m.delivery_hash;
@@ -578,6 +669,24 @@ export class Market {
     return info;
   }
 
+  /** Bond a solver locks to take a mission. Cheap missions need none, so newcomers can start with them. */
+  private bondFor(price: number): number {
+    return Math.floor(price * this.cfg.takeBondRatio);
+  }
+
+  private maxFreePrice(): number {
+    return this.cfg.takeBondRatio > 0 ? Math.ceil(1 / this.cfg.takeBondRatio) - 1 : this.cfg.maxMissionPriceCredits;
+  }
+
+  private requireDeposit(agentId: string, fee: number, what: string) {
+    const balance = this.c.balance(agentId);
+    check(
+      balance >= fee,
+      "insufficient_credits",
+      `${what} locks the mediators' fee (${fee} credits), returned if you win. Your balance is ${balance}.`,
+    );
+  }
+
   private checkEnvelope(envelope: string) {
     check(
       typeof envelope === "string" && /^[A-Za-z0-9_-]+$/.test(envelope) && envelope.length >= 80,
@@ -587,7 +696,8 @@ export class Market {
     check(envelope.length <= this.cfg.maxEnvelopeChars, "envelope_too_large", "Content too large for the relay");
   }
 
-  private message(missionId: string, kind: string, fromId: string, toId: string, envelope: string) {
+  /** @internal Puts ciphertext in the relay. Used by the certifier for its control missions. */
+  message(missionId: string, kind: string, fromId: string, toId: string, envelope: string) {
     this.db
       .prepare(
         `INSERT INTO messages (id, mission_id, kind, from_id, to_id, envelope, size, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
@@ -596,7 +706,7 @@ export class Market {
   }
 
   /** Draws mediators among agents with a track record, never the parties nor agents already involved. */
-  private draw(missionId: string, round: number, seats: number) {
+  draw(missionId: string, round: number, seats: number) {
     const m = this.row(missionId);
     const taken = this.db
       .prepare(
@@ -646,7 +756,7 @@ export class Market {
    * Mediators who voted with the final verdict earn the fee, paid by the losing party; the others earn
    * nothing and lose reputation. Reputation from missions only counts once per pair of agents per month.
    */
-  private finalize(missionId: string, verdict: Verdict, reason: string) {
+  finalize(missionId: string, verdict: Verdict, reason: string) {
     tx(this.db, () => {
       const m = this.row(missionId);
       const closed = this.db
@@ -677,18 +787,29 @@ export class Market {
       const voters = this.db
         .prepare(`SELECT mediator_id, verdict FROM mediations WHERE mission_id = ? AND verdict IN ('accept', 'refuse')`)
         .all(missionId) as { mediator_id: string; verdict: Verdict }[];
-      const loser = verdict === "accept" ? m.requester_id : solver;
+      const requesterLost = verdict === "accept";
+      const loser = requesterLost ? m.requester_id : solver;
       if (voters.length > 0 || reason === "missing evidence") this.c.reputation(loser, false);
-      if (voters.length > 0) {
-        for (const v of voters) {
-          const right = v.verdict === verdict;
-          if (right) {
-            this.c.credit(v.mediator_id, this.cfg.mediationFeeCredits);
-            this.c.credit(loser, -this.cfg.mediationFeeCredits);
-            this.db.prepare(`UPDATE mediations SET paid = 1 WHERE mission_id = ? AND mediator_id = ?`).run(missionId, v.mediator_id);
-          }
-          this.c.reputation(v.mediator_id, right);
+
+      // Fees of the mediators who voted with the final verdict: from the loser's deposit first, then
+      // its balance (never below zero). A shortfall is created, and recorded, so mediators are always paid.
+      const fee = this.cfg.mediationFeeCredits;
+      const owed = fee * voters.filter((v) => v.verdict === verdict).length;
+      const loserDeposit = requesterLost ? m.requester_deposit : m.solver_deposit;
+      const winnerDeposit = requesterLost ? m.solver_deposit : m.requester_deposit;
+      const fromDeposit = Math.min(owed, loserDeposit);
+      const fromBalance = this.c.debit(loser, owed - fromDeposit);
+      this.c.supply("mediation", owed - fromDeposit - fromBalance);
+      this.c.credit(loser, loserDeposit - fromDeposit);
+      this.c.credit(requesterLost ? solver : m.requester_id, winnerDeposit);
+      this.db.prepare(`UPDATE missions SET requester_deposit = 0, solver_deposit = 0 WHERE id = ?`).run(missionId);
+      for (const v of voters) {
+        const right = v.verdict === verdict;
+        if (right) {
+          this.c.credit(v.mediator_id, fee);
+          this.db.prepare(`UPDATE mediations SET paid = 1 WHERE mission_id = ? AND mediator_id = ?`).run(missionId, v.mediator_id);
         }
+        this.c.reputation(v.mediator_id, right);
       }
       this.db.prepare(`UPDATE mediations SET verdict = 'expired' WHERE mission_id = ? AND verdict IS NULL`).run(missionId);
     });
@@ -697,17 +818,33 @@ export class Market {
   /** Applies every deadline. Called before each market operation. */
   sweep() {
     const cfg = this.cfg;
-    // Spec never handed over: the solver is released.
-    this.db
-      .prepare(`UPDATE missions SET status = 'open', solver_id = NULL, taken_at = NULL WHERE status = 'taken' AND taken_at < ?`)
-      .run(minutesAgo(cfg.handoffTtlMinutes));
-    // Not delivered in time: back on the market.
-    this.db
-      .prepare(
-        `UPDATE missions SET status = 'open', solver_id = NULL, taken_at = NULL, spec_sent_at = NULL
-         WHERE status = 'in_progress' AND spec_sent_at < ?`,
-      )
-      .run(minutesAgo(cfg.deliveryTtlMinutes));
+    // Spec never handed over: not the solver's fault, it is released with its bond.
+    for (const r of this.db
+      .prepare(`SELECT id, solver_id, solver_bond FROM missions WHERE status = 'taken' AND taken_at < ?`)
+      .all(minutesAgo(cfg.handoffTtlMinutes)) as { id: string; solver_id: string; solver_bond: number }[]) {
+      tx(this.db, () => {
+        const res = this.db
+          .prepare(`UPDATE missions SET status = 'open', solver_id = NULL, taken_at = NULL, solver_bond = 0 WHERE id = ? AND status = 'taken'`)
+          .run(r.id);
+        if (res.changes === 1) this.c.credit(r.solver_id, r.solver_bond);
+      });
+    }
+    // Not delivered in time: back on the market. The bond goes to the requester for the time lost.
+    for (const r of this.db
+      .prepare(`SELECT id, requester_id, solver_id, solver_bond FROM missions WHERE status = 'in_progress' AND spec_sent_at < ?`)
+      .all(minutesAgo(cfg.deliveryTtlMinutes)) as { id: string; requester_id: string; solver_id: string; solver_bond: number }[]) {
+      tx(this.db, () => {
+        const res = this.db
+          .prepare(
+            `UPDATE missions SET status = 'open', solver_id = NULL, taken_at = NULL, spec_sent_at = NULL, solver_bond = 0
+             WHERE id = ? AND status = 'in_progress'`,
+          )
+          .run(r.id);
+        if (res.changes !== 1) return;
+        this.c.credit(r.requester_id, r.solver_bond);
+        this.c.reputation(r.solver_id, false);
+      });
+    }
     // Not reviewed in time: accepted.
     for (const r of this.db
       .prepare(`SELECT id FROM missions WHERE status = 'delivered' AND delivered_at < ?`)
@@ -737,6 +874,7 @@ export class Market {
       .all() as { id: string; status: MissionStatus }[]) {
       this.draw(d.id, d.status === "disputed" ? 1 : 2, d.status === "disputed" ? 1 : cfg.appealMediators);
     }
+    this.certifier?.sweep();
     // Relay: ciphertext is kept at most messageTtlDays.
     this.db
       .prepare(`UPDATE messages SET envelope = NULL WHERE envelope IS NOT NULL AND created_at < ?`)

@@ -25,7 +25,7 @@ describe("worker", () => {
     m = await market();
     const req = await m.agent(20);
     const events: WorkerEvent[] = [];
-    const worker = new Worker(await m.agent(), { kinds: ["code"], solver: { command: FAKE_SOLVER, sandbox: "none" } }, (e) =>
+    const worker = new Worker(await m.agent(2), { kinds: ["code"], solver: { command: FAKE_SOLVER, sandbox: "none" } }, (e) =>
       events.push(e),
     );
     const posted = await req.postMission(SPEC);
@@ -56,7 +56,7 @@ describe("worker", () => {
     m = await market();
     const mediator = await m.agent(0, { mediator: true });
     const req = await m.agent(20);
-    const sol = await m.agent();
+    const sol = await m.agent(2);
     const posted = await req.postMission(SPEC);
     await sol.takeMission(posted.missionId);
     await req.sync();

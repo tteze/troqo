@@ -137,6 +137,16 @@ export class Work {
       `You already opened ${today} batches in the last 24 hours. Solve missions or mediate to earn more.`,
     );
 
+    const { budget, minted } = this.faucet();
+    const reserved = (this.c.db
+      .prepare(`SELECT COUNT(*) AS n FROM batches WHERE status = 'awaiting_work'`)
+      .get() as { n: number }).n * cfg.workBatchSize;
+    check(
+      minted + reserved + cfg.workBatchSize <= budget,
+      "faucet_dry",
+      `The market created its ${budget} credits of the last 24 hours. Solve a mission or mediate, or come back later.`,
+    );
+
     const real = this.pickRealTasks(agentId, cfg.workBatchSize);
     const gold = this.pickGoldTasks(agentId, cfg.goldPerBatch);
     if (real.length < cfg.workBatchSize || gold.length < cfg.goldPerBatch) {
@@ -203,7 +213,8 @@ export class Work {
 
     const controls = tasks.filter((t) => t.expected !== null);
     const passed = controls.every((t) => normalized.get(t.id) === t.expected);
-    const earned = passed ? tasks.length - controls.length : 0;
+    const { budget, minted } = this.faucet();
+    const earned = passed ? Math.min(tasks.length - controls.length, Math.max(0, budget - minted)) : 0;
     const tokens = tasks.reduce((s, t) => s + approxTokens(t.instruction + t.input + t.options + normalized.get(t.id)), 0);
 
     tx(this.c.db, () => {
@@ -230,6 +241,24 @@ export class Work {
       this.c.supply("work", earned);
     });
     return { passed, creditsEarned: earned, creditsBalance: this.c.balance(agentId) };
+  }
+
+  /**
+   * Market-wide credit creation over the last 24 hours, and its cap: a base plus a share of the
+   * daily credits paid on accepted missions (averaged over 7 days), so it follows real activity.
+   */
+  faucet(): { budget: number; minted: number } {
+    const cfg = this.c.config;
+    const paid = this.c.db
+      .prepare(
+        `SELECT COALESCE(SUM(price_credits), 0) AS c FROM missions
+         WHERE status = 'accepted' AND honeypot_id IS NULL AND control_id IS NULL AND closed_at >= ?`,
+      )
+      .get(minutesAgo(7 * 24 * 60)) as { c: number };
+    const minted = this.c.db
+      .prepare(`SELECT COALESCE(SUM(credits), 0) AS c FROM supply WHERE reason = 'work' AND created_at >= ?`)
+      .get(minutesAgo(24 * 60)) as { c: number };
+    return { budget: Math.floor(cfg.mintBaseCreditsPerDay + (cfg.mintActivityRatio * paid.c) / 7), minted: minted.c };
   }
 
   /** Real tasks whose answers reached consensus: the work product of the faucet. */
@@ -263,6 +292,7 @@ export class Work {
       passRate: graded ? Math.round(((counts.passed ?? 0) / graded) * 100) / 100 : null,
       avgApproxTokensPerBatch: avg.t === null ? null : Math.round(avg.t),
       resolvedTasks: this.resolvedTasks().length,
+      faucet: this.faucet(),
     };
   }
 }

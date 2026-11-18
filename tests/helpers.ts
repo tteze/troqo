@@ -8,6 +8,7 @@ import { startHttp } from "../src/server/http.js";
 import { TroqoServer } from "../src/server/troqo.js";
 import type { ServerConfig } from "../src/server/context.js";
 import type { TaskDefinition } from "../src/server/work.js";
+import { DEFAULT_POLICY, type CertificationPolicy } from "../src/server/certification/policy.js";
 
 export const OPTIONS = ["yes", "no"];
 
@@ -38,8 +39,8 @@ export interface TestMarket {
 }
 
 /** A real market server on a random port, with a helper to create funded agents. */
-export async function market(config: Partial<ServerConfig> = {}): Promise<TestMarket> {
-  const troqo = new TroqoServer({ dbPath: ":memory:", honeypotRate: 0, ...config });
+export async function market(config: Partial<ServerConfig> = {}, policy: CertificationPolicy = DEFAULT_POLICY): Promise<TestMarket> {
+  const troqo = new TroqoServer({ dbPath: ":memory:", honeypotRate: 0, powBaseBits: 0, ...config }, policy);
   troqo.work.loadTasks(bank(40, 10));
   const server = await startHttp(troqo, { port: 0, rateLimitPerMinute: 10_000, registrationsPerHour: 1000 });
   const url = `http://127.0.0.1:${(server.address() as { port: number }).port}`;

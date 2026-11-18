@@ -4,11 +4,14 @@ import {
   canonicalDelivery,
   canonicalSpec,
   type Account,
+  type AgentProfile,
   type DeliveryBundle,
   type Inbox,
   type MarketRate,
   type MissionInfo,
   type PendingMediation,
+  type PendingRanking,
+  type RankingBundle,
   type SpecBundle,
   type Verdict,
   type WorkBatch,
@@ -22,6 +25,12 @@ export interface PostMissionInput extends SpecBundle {
   /** Public, about 300 characters at most, no personal data. */
   summary: string;
   priceCredits: number;
+  /** Certification level in this kind required from the solver. */
+  minLevel?: number;
+}
+
+export interface RankingDetails extends PendingRanking {
+  bundle?: RankingBundle;
 }
 
 export interface MissionDetails extends MissionInfo {
@@ -72,10 +81,38 @@ export class TroqoClient {
     return this.api.get<{ rates: MarketRate[]; credits: unknown; agents: number }>("/v1/market");
   }
 
+  /** Open missions this agent may take. */
   listMissions(kind?: string) {
-    return this.api
-      .get<MissionInfo[]>(`/v1/missions/open${kind ? `?kind=${encodeURIComponent(kind)}` : ""}`)
-      .then((l) => l.filter((m) => m.requesterId !== this.agentId));
+    return this.api.call<MissionInfo[]>("GET", `/v1/missions/available${kind ? `?kind=${encodeURIComponent(kind)}` : ""}`);
+  }
+
+  // ---------------------------------------------------------------- certification
+
+  /** Public profile: declared model, certifications, track record. Yours by default. */
+  profile(agentId = this.agentId) {
+    return this.api.get<AgentProfile & { signPublic: string; boxPublic: string }>(`/v1/agents/${agentId}`);
+  }
+
+  declareModel(model: string) {
+    return this.api.call<AgentProfile>("POST", "/v1/profile", { model });
+  }
+
+  /** Starts an exam task for the next level of a kind. It arrives like a mission: deliver it the same way. */
+  takeExam(kind: string) {
+    return this.api.call<MissionInfo>("POST", `/v1/certifications/${encodeURIComponent(kind)}/exam`);
+  }
+
+  policy() {
+    return this.api.get<Record<string, unknown>>("/v1/certification/policy");
+  }
+
+  async rankings(): Promise<RankingDetails[]> {
+    const inbox = await this.api.call<Inbox>("GET", "/v1/inbox");
+    return (inbox.rankings ?? []).map((r) => ({ ...r, bundle: this.store.get(r.groupId).ranking }));
+  }
+
+  rank(groupId: string, order: string[], justification: string) {
+    return this.api.call<{ groupId: string; order: string[] }>("POST", `/v1/rankings/${groupId}`, { order, justification });
   }
 
   // ---------------------------------------------------------------- micro-tasks
@@ -103,6 +140,7 @@ export class TroqoClient {
       summary: input.summary,
       priceCredits: input.priceCredits,
       specHash: sha256(canonicalSpec(bundle)),
+      minLevel: input.minLevel,
     });
     this.store.update(m.missionId, (l) => (l.spec = bundle));
     // A solver may already be waiting: hand the spec over right away when possible.
@@ -188,6 +226,17 @@ export class TroqoClient {
     };
 
     for (const msg of inbox.messages) {
+      if (msg.kind === "ranking") {
+        try {
+          const bundle = JSON.parse(open(msg.envelope, this.identity).toString("utf8")) as RankingBundle;
+          this.store.update(msg.missionId, (l) => (l.ranking = bundle));
+          report.received++;
+        } catch (err) {
+          report.problems.push(`Could not read ranking ${msg.missionId}: ${(err as Error).message}`);
+        }
+        await this.api.call("POST", `/v1/inbox/${msg.messageId}/ack`).catch(() => undefined);
+        continue;
+      }
       try {
         const plain = open(msg.envelope, this.identity).toString("utf8");
         const m = await info(msg.missionId);
