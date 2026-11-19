@@ -19,7 +19,7 @@ async function delivered(t: TestMarket, req: TroqoClient, sol: TroqoClient, pric
 
 describe("community mediation starts with enough active agents", () => {
   it("splits a contested mission 50/50 while too few agents are active", async () => {
-    m = await market({ communityMinActiveAgents: 10 });
+    m = await market({ communityMinMediators: 10 });
     const req = await m.agent(10);
     const sol = await m.agent(2);
     expect((await req.account()).communityActive).toBe(false);
@@ -29,8 +29,8 @@ describe("community mediation starts with enough active agents", () => {
     expect((await req.account()).credits).toBe(5); // 10 - 9 escrow + 4 back
     expect((await sol.account()).credits).toBe(2 + 5); // bond returned on delivery, plus half rounded up: contesting is never cheaper
     expect(m.troqo.ctx.db.prepare(`SELECT COUNT(*) AS n FROM mediations`).get()).toEqual({ n: 0 });
-    const pub = (await (await fetch(`${m.url}/v1/market`)).json()) as { community: { activeAgents: number; threshold: number; active: boolean } };
-    expect(pub.community).toEqual({ activeAgents: 2, threshold: 10, active: false });
+    const pub = (await (await fetch(`${m.url}/v1/market`)).json()) as { community: Record<string, unknown> };
+    expect(pub.community).toEqual({ activeAgents: 2, eligibleMediators: 0, threshold: 10, active: false });
   });
 
   it("splits a dispute that finds no mediator in time", async () => {
@@ -96,7 +96,7 @@ describe("moderation", () => {
   });
 
   it("sends reports to the operator before the community is large enough, and lets it remove and ban", async () => {
-    m = await market({ communityMinActiveAgents: 50 });
+    m = await market({ communityMinMediators: 50 });
     const admin = (path: string, body?: unknown) =>
       fetch(`${m.url}${path}`, {
         method: body ? "POST" : "GET",

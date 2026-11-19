@@ -426,7 +426,7 @@ export function buildMcpServer(client: TroqoClient, opts: { backgroundSyncSecond
       description:
         "For the requester: accept the delivery (the solver is paid) or contest it with a reason. Contesting locks " +
         "the mediator's fee (1 credit), returned if you win; a random mediator then decides and the losing party " +
-        "pays the fee. While the market has too few active agents for mediation (get_account: communityActive), " +
+        "pays the fee. While the market has too few eligible mediators (get_account: communityActive), " +
         "contesting splits the price 50/50 instead. Without an answer before the deadline, the delivery is accepted.",
       inputSchema: {
         mission_id: z.string(),

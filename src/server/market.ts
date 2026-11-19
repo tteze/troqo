@@ -31,6 +31,12 @@ import {
 
 const KIND = /^[a-z][a-z0-9-]{1,30}$/;
 const HASH = /^[0-9a-f]{64}$/;
+
+function median(xs: number[]): number {
+  const a = [...xs].sort((x, y) => x - y);
+  const mid = Math.floor(a.length / 2);
+  return a.length % 2 ? a[mid] : (a[mid - 1] + a[mid]) / 2;
+}
 /** Same format as a declared model (Certifier.setModel). */
 const MODEL = /^[a-z0-9][a-z0-9._-]{1,59}$/;
 const ACTIVE: MissionStatus[] = ["open", "taken", "in_progress", "delivered", "disputed", "mediated", "appealed"];
@@ -620,40 +626,52 @@ export class Market {
          FROM missions WHERE honeypot_id IS NULL AND control_id IS NULL GROUP BY kind ORDER BY open DESC, accepted30d DESC, kind`,
       )
       .all(since, since) as unknown as MarketRate[];
-    // The going price averages pairs of agents, not missions: trading with yourself between a few
-    // identities moves it no more than one honest pair does.
-    const byPair = new Map(
+    // The going price is the median over pairs of agents, not missions: trading with yourself between a
+    // few identities moves it no more than one honest pair does, and a ring of extreme prices barely moves it.
+    const pairs = this.db
+      .prepare(
+        `SELECT kind, requester_id, solver_id, solver_model AS model, AVG(price_credits) AS p, COUNT(*) AS n FROM missions
+         WHERE status = 'accepted' AND honeypot_id IS NULL AND control_id IS NULL AND closed_at >= ?
+         GROUP BY kind, requester_id, solver_id, solver_model`,
+      )
+      .all(since) as { kind: string; requester_id: string; solver_id: string; model: string | null; p: number; n: number }[];
+    const known = new Set(
       (
         this.db
           .prepare(
-            `SELECT kind, AVG(p) AS avg, COUNT(*) AS pairs FROM (
-               SELECT kind, AVG(price_credits) AS p FROM missions
-               WHERE status = 'accepted' AND honeypot_id IS NULL AND control_id IS NULL AND closed_at >= ?
-               GROUP BY kind, requester_id, solver_id)
-             GROUP BY kind`,
+            `SELECT requester_id FROM missions WHERE status = 'accepted' AND honeypot_id IS NULL AND control_id IS NULL
+             GROUP BY requester_id HAVING COUNT(DISTINCT solver_id) >= ?`,
           )
-          .all(since) as { kind: string; avg: number; pairs: number }[]
-      ).map((r) => [r.kind, r]),
+          .all(this.cfg.modelRateMinRequesterSolvers) as { requester_id: string }[]
+      ).map((r) => r.requester_id),
     );
-    // Per model the solvers declared at delivery, pair-weighted the same way, shown only above a few pairs.
-    const perModel = this.db
-      .prepare(
-        `SELECT kind, model, AVG(p) AS avg, COUNT(*) AS pairs, SUM(n) AS accepted FROM (
-           SELECT kind, solver_model AS model, AVG(price_credits) AS p, COUNT(*) AS n FROM missions
-           WHERE status = 'accepted' AND honeypot_id IS NULL AND control_id IS NULL AND closed_at >= ? AND solver_model IS NOT NULL
-           GROUP BY kind, solver_model, requester_id, solver_id)
-         GROUP BY kind, model HAVING COUNT(*) >= ? ORDER BY avg DESC`,
-      )
-      .all(since, this.cfg.modelRateMinPairs) as { kind: string; model: string; avg: number; pairs: number; accepted: number }[];
+    const round = (x: number) => Math.round(x * 10) / 10;
     return rows.map((r) => {
-      const p = byPair.get(r.kind);
+      const mine = pairs.filter((x) => x.kind === r.kind);
+      // A pair whose solver changed model is still one pair for the kind's rate.
+      const byPair = new Map<string, { sum: number; n: number }>();
+      for (const x of mine) {
+        const k = `${x.requester_id} ${x.solver_id}`;
+        const v = byPair.get(k) ?? { sum: 0, n: 0 };
+        byPair.set(k, { sum: v.sum + x.p * x.n, n: v.n + x.n });
+      }
+      const pairPrices = [...byPair.values()].map((v) => v.sum / v.n);
+      // Per model the solvers declared at delivery, from known requesters only, shown above a few pairs.
+      const byModel = new Map<string, typeof mine>();
+      for (const x of mine) if (x.model && known.has(x.requester_id)) byModel.set(x.model, [...(byModel.get(x.model) ?? []), x]);
       return {
         ...r,
-        avgAcceptedPrice: p ? Math.round(p.avg * 10) / 10 : null,
-        pairs30d: p?.pairs ?? 0,
-        models: perModel
-          .filter((x) => x.kind === r.kind)
-          .map((x) => ({ model: x.model, avgAcceptedPrice: Math.round(x.avg * 10) / 10, pairs30d: x.pairs, accepted30d: x.accepted })),
+        avgAcceptedPrice: pairPrices.length ? round(median(pairPrices)) : null,
+        pairs30d: pairPrices.length,
+        models: [...byModel.entries()]
+          .filter(([, ps]) => ps.length >= this.cfg.modelRateMinPairs)
+          .map(([model, ps]) => ({
+            model,
+            avgAcceptedPrice: round(median(ps.map((x) => x.p))),
+            pairs30d: ps.length,
+            accepted30d: ps.reduce((s, x) => s + x.n, 0),
+          }))
+          .sort((a, b) => b.avgAcceptedPrice - a.avgAcceptedPrice),
       };
     });
   }

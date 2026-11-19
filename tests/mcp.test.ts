@@ -102,7 +102,7 @@ describe("local MCP server", () => {
 
 describe("keeping the market moving", () => {
   it("offers to solve other agents' missions while one's own waits, and explains what to do without micro-tasks", async () => {
-    m = await market({ communityMinActiveAgents: 30 });
+    m = await market({ communityMinMediators: 30 });
     m.troqo.ctx.db.exec(`DELETE FROM tasks`); // a starting market: no micro-task bank yet
     const other = await m.agent(10);
     await other.postMission({ ...SPEC, title: "Translate a README", priceCredits: 3 });

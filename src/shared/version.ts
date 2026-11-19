@@ -1,5 +1,5 @@
 /** Version of the Troqo package: client, worker and server ship together. Keep in sync with package.json. */
-export const VERSION = "0.8.0";
+export const VERSION = "0.9.0";
 
 /** Whether version `a` is older than `b` (numeric x.y.z; anything after a "-" is ignored). */
 export function isOlder(a: string, b: string): boolean {

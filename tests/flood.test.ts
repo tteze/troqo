@@ -166,7 +166,7 @@ describe("start-up advance", () => {
   };
 
   it("lets an agent with no micro-task left post beyond its balance, then repays from what it earns", async () => {
-    m = await market({ communityMinActiveAgents: 30 });
+    m = await market({ communityMinMediators: 30 });
     const req = await m.agent(0);
     await expect(req.postMission({ ...SPEC, priceCredits: 3 })).rejects.toMatchObject({ code: "insufficient_credits" });
     expect((await req.account()).advanceCredits).toBe(0); // micro-tasks first
@@ -191,7 +191,7 @@ describe("start-up advance", () => {
   });
 
   it("pays the solver normally and keeps the debt with the requester", async () => {
-    m = await market({ communityMinActiveAgents: 30 });
+    m = await market({ communityMinMediators: 30 });
     const req = await m.agent(0);
     const sol = await m.agent(10); // enough for the bond
     await drain(req);
@@ -210,7 +210,7 @@ describe("start-up advance", () => {
   });
 
   it("stops once community mediation is on", async () => {
-    m = await market({ communityMinActiveAgents: 0 });
+    m = await market({ communityMinMediators: 0 });
     const req = await m.agent(0);
     await drain(req);
     expect((await req.account()).advanceCredits).toBe(0);
@@ -220,7 +220,7 @@ describe("start-up advance", () => {
 
 describe("going rate per declared model", () => {
   it("records the solver's model at delivery and shows a model's rate only above a few pairs", async () => {
-    m = await market({ modelRateMinPairs: 2 });
+    m = await market({ modelRateMinPairs: 2, modelRateMinRequesterSolvers: 1 });
     const req = await m.agent(50);
     const big = await m.agent(10);
     const small = await m.agent(10);
@@ -274,7 +274,7 @@ describe("going rate per declared model", () => {
 
 describe("track records instead of bad marks", () => {
   it("shows a new identity as unknown, and a requester's paid and contested missions to solvers", async () => {
-    m = await market({ communityMinActiveAgents: 30 });
+    m = await market({ communityMinMediators: 30 });
     const req = await m.agent(30);
     const sol = await m.agent(10);
     expect((await req.account()).reputation).toBeNull(); // unknown, not a perfect 1.0
@@ -295,5 +295,54 @@ describe("track records instead of bad marks", () => {
     expect(again.requester).toEqual({ paid: 1, paidSolvers: 1, contested: 1 });
     expect((await sol.profile(req.agentId)).asRequester).toEqual({ paid: 1, paidSolvers: 1, contested: 1 });
     expect((await sol.account()).reputation).toBe(1); // solved one: now it has a track record
+  });
+});
+
+describe("lessons from the market simulation", () => {
+  const accepted = (t: TestMarket, requester: string, solver: string, price: number, model: string | null = null, kind = "code") => {
+    const now = new Date().toISOString();
+    t.troqo.ctx.db
+      .prepare(
+        `INSERT INTO missions (id, requester_id, kind, title, summary, price_credits, spec_hash, status, solver_id, solver_model, created_at, closed_at)
+         VALUES (?, ?, ?, 't', 's', ?, 'h', 'accepted', ?, ?, ?, ?)`,
+      )
+      .run(`${requester}-${solver}-${Math.random()}`, requester, kind, price, solver, model, now, now);
+  };
+
+  it("switches community mediation on with eligible mediators, not with empty identities", async () => {
+    m = await market({ communityMinMediators: 2 });
+    for (let i = 0; i < 10; i++) await (await m.agent()).account(); // fake accounts, active but with no work
+    expect(m.troqo.ctx.communityActive()).toBe(false);
+    const med = await m.agent(0, { mediator: true });
+    await med.account();
+    await (await m.agent(0, { mediator: true })).account();
+    expect(m.troqo.ctx.communityActive()).toBe(true);
+
+    // A dip below the threshold does not switch it off while mediators are being drawn.
+    m.troqo.ctx.db.prepare(`INSERT INTO mediations (mission_id, round, mediator_id, assigned_at) VALUES ('x', 1, ?, ?)`).run(med.agentId, new Date().toISOString());
+    m.troqo.ctx.db.prepare(`UPDATE agents SET reputation = 0 WHERE agent_id != ?`).run(med.agentId);
+    expect(m.troqo.ctx.activeMediators()).toBe(1);
+    expect(m.troqo.ctx.communityActive()).toBe(true);
+    m.troqo.ctx.db.prepare(`UPDATE agents SET reputation = 0`).run();
+    expect(m.troqo.ctx.communityActive()).toBe(false); // below half the threshold
+  });
+
+  it("lets a solver paid by many requesters mediate without micro-task batches", async () => {
+    m = await market({ mediatorMinRequesters: 3, mediatorRequestersWithoutBatches: 5 });
+    const sol = await m.agent(10);
+    for (let i = 0; i < 4; i++) accepted(m, `req${i}`, sol.agentId, 5);
+    expect(m.troqo.ctx.canMediate(sol.agentId)).toBe(false); // 4 requesters and no batch
+    accepted(m, "req4", sol.agentId, 5);
+    expect(m.troqo.ctx.canMediate(sol.agentId)).toBe(true);
+  });
+
+  it("keeps a ring of identities paying each other from setting the going rate or a model's price", async () => {
+    m = await market({ modelRateMinPairs: 3 });
+    for (const [a, b] of [["s1", "s2"], ["s2", "s3"], ["s3", "s1"]]) for (let i = 0; i < 5; i++) accepted(m, a, b, 60, "model-c");
+    for (let r = 0; r < 4; r++) for (let s = 0; s < 3; s++) accepted(m, `honest${r}`, `solver${s}`, 6 + s, "model-a");
+    const [code] = m.troqo.market.rates();
+    expect(code.pairs30d).toBe(15);
+    expect(code.avgAcceptedPrice).toBe(7); // the median of the pairs, not pulled toward 60
+    expect(code.models.map((x) => x.model)).toEqual(["model-a"]); // the ring's requesters paid only one solver each
   });
 });

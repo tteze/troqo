@@ -9,6 +9,7 @@ import { DEFAULT_SERVER, loadConfig, loadIdentity, saveConfig, troqoHome } from 
 import { API_RELAYS, startEgressProxy } from "./client/egress-proxy.js";
 import { buildMcpServer, outdatedNotice, VERSION } from "./client/mcp.js";
 import { sandboxSetupCommands } from "./client/sandbox.js";
+import { runSandboxCheck } from "./client/sandbox-check.js";
 import { Worker, type WorkerConfig } from "./client/worker.js";
 import { startHttp } from "./server/http.js";
 import type { HoneypotDefinition } from "./server/market.js";
@@ -34,6 +35,7 @@ Agent side (your machine):
   mcp                   Run the MCP server your agent connects to (stdio).
   worker [--once]       Solve missions and mediate in the background (see "worker" in config.json).
   sandbox setup [--run] Docker network and egress proxy for the worker sandbox (prints, or runs with --run).
+  sandbox check         Start a solver container and check what it can and cannot reach.
   egress-proxy --allow host1,host2 [--relay anthropic] [--port 3128]
                         HTTPS proxy limited to the allowed hosts; --relay keeps API keys out of the sandbox.
   release verify <troqo.tgz> [--sig file] [--key release-public.pem]
@@ -146,6 +148,14 @@ async function main() {
     case "sandbox": {
       const worker = loadConfig().worker;
       const allow = (flag(args, "--allow") ?? "api.anthropic.com,api.openai.com").split(",");
+      if (args[0] === "check") {
+        const results = runSandboxCheck(allow, worker?.solver?.docker);
+        for (const r of results) console.log(`${r.ok ? "✓" : "✗"} ${r.name}: ${r.detail}`);
+        const failed = results.filter((r) => !r.ok).length;
+        console.log(failed ? `\n${failed} check(s) failed: do not run the worker with this sandbox.` : "\nThe sandbox behaves as expected.");
+        process.exitCode = failed ? 1 : 0;
+        break;
+      }
       const cmds = sandboxSetupCommands(allow, worker?.solver?.docker);
       for (const c of cmds) {
         console.log(c.join(" "));

@@ -129,7 +129,8 @@ export class TroqoServer {
       faucet: this.work.faucet(),
       community: {
         activeAgents: this.ctx.activeAgents(),
-        threshold: this.config.communityMinActiveAgents,
+        eligibleMediators: this.ctx.activeMediators(),
+        threshold: this.config.communityMinMediators,
         active: this.ctx.communityActive(),
       },
       advance: { maxCredits: this.config.advanceMaxCredits, available: this.config.advanceMaxCredits > 0 && !this.ctx.communityActive() },

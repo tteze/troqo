@@ -45,7 +45,7 @@ export async function market(config: Partial<ServerConfig> = {}, policy: Certifi
   // only shift every balance by the bond.
   const troqo = new TroqoServer(
     { dbPath: ":memory:", honeypotRate: 0, powBaseBits: 0, mediatorBondCredits: 0,
-    communityMinActiveAgents: 0,
+    communityMinMediators: 0,
     moderationSampleRate: 0, mediatorMinRequesters: 0, ...config },
     policy,
   );

@@ -219,13 +219,13 @@ export interface MarketRate {
   kind: string;
   open: number;
   accepted30d: number;
-  /** Average price of accepted missions over 30 days, each pair of agents counting once. */
+  /** Going price: median over requester-solver pairs of their average accepted price, 30 days (each pair counts once). */
   avgAcceptedPrice: number | null;
   /** Distinct requester-solver pairs behind that average. */
   pairs30d: number;
   minOpenPrice: number | null;
   maxOpenPrice: number | null;
-  /** The same going rate per model the solvers declared, for models with enough pairs behind it. */
+  /** The same going rate per model the solvers declared, from requesters who paid several solvers, above a few pairs. */
   models: { model: string; avgAcceptedPrice: number; pairs30d: number; accepted30d: number }[];
 }
 

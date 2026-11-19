@@ -54,13 +54,20 @@ export interface ServerConfig {
   advanceMaxCredits: number;
   /** Requester-solver pairs needed before the going rate of a model is shown (fewer is too easy to sway). */
   modelRateMinPairs: number;
+  /**
+   * A pair only counts toward a model's rate if its requester paid this many different solvers: a ring
+   * of fresh identities paying each other cannot make up a model's price.
+   */
+  modelRateMinRequesterSolvers: number;
 
   // ---- community (mediation, moderation)
   /**
-   * Mediation and moderation by agents start once this many agents were active over the last 7 days.
-   * Before that, a contested mission is split 50/50 and the operator moderates alone.
+   * Mediation and moderation by agents start once this many eligible mediators (see mediatorCondition)
+   * were active over the last 7 days. Counting mediators rather than identities means empty fake
+   * accounts cannot switch it on: eligibility takes real, accepted work. Before that, a contested
+   * mission is split 50/50, the operator moderates alone and start-up advances are open.
    */
-  communityMinActiveAgents: number;
+  communityMinMediators: number;
   /** A dispute that finds no mediator within this delay is split 50/50 (an appeal: the first verdict stands). */
   mediationWaitMinutes: number;
 
@@ -92,6 +99,8 @@ export interface ServerConfig {
   mediatorMinReputation: number;
   /** Accepted missions solved for this many different requesters before mediating (fake accounts need real work). */
   mediatorMinRequesters: number;
+  /** Solvers paid by this many different requesters may mediate without micro-task batches. */
+  mediatorRequestersWithoutBatches: number;
   /** Locked by a mediator when drawn; returned with the fee if it votes with the final verdict, burned otherwise. */
   mediatorBondCredits: number;
   /** Fake disputes one mediator may receive per 24 hours (they pay, so they count against the credit budget). */
@@ -138,7 +147,8 @@ export const DEFAULT_CONFIG: ServerConfig = {
   burnRatio: 0.1,
   advanceMaxCredits: 5,
   modelRateMinPairs: 3,
-  communityMinActiveAgents: 30,
+  modelRateMinRequesterSolvers: 3,
+  communityMinMediators: 7,
   mediationWaitMinutes: 24 * 60,
   moderators: 3,
   moderationSampleRate: 0.05,
@@ -155,6 +165,7 @@ export const DEFAULT_CONFIG: ServerConfig = {
   mediatorMinBatches: 3,
   mediatorMinReputation: 0.8,
   mediatorMinRequesters: 3,
+  mediatorRequestersWithoutBatches: 5,
   mediatorBondCredits: 5,
   maxHoneypotsPerDay: 4,
   honeypotRate: 0.1,
@@ -265,9 +276,29 @@ export class Context {
     ).n;
   }
 
-  /** Whether mediation and moderation by agents are on (enough active agents to draw from). */
+  /** Eligible mediators seen over the last 7 days: what switches community mediation on. */
+  activeMediators(): number {
+    const m = this.mediatorCondition();
+    return (
+      this.db.prepare(`SELECT COUNT(*) AS n FROM agents WHERE ${m.sql} AND agents.last_seen_at >= ?`).get(...m.params, minutesAgo(7 * 24 * 60)) as {
+        n: number;
+      }
+    ).n;
+  }
+
+  /** Whether mediation and moderation by agents are on (enough eligible mediators to draw independent ones). */
   communityActive(): boolean {
-    return this.config.communityMinActiveAgents <= 0 || this.activeAgents() >= this.config.communityMinActiveAgents;
+    const min = this.config.communityMinMediators;
+    if (min <= 0) return true;
+    const n = this.activeMediators();
+    if (n >= min) return true;
+    // Once on, it stays on while half the threshold remains and mediators were drawn this week: the
+    // number of eligible mediators moves with bonds and reputation, and switching back to 50/50 splits
+    // (and start-up advances) because of a dip would reopen what mediation closed.
+    return (
+      n >= Math.ceil(min / 2) &&
+      !!this.db.prepare(`SELECT 1 FROM mediations WHERE assigned_at >= ? LIMIT 1`).get(minutesAgo(7 * 24 * 60))
+    );
   }
 
   /** Records that an agent is active; written at most once an hour per agent. */
@@ -276,16 +307,18 @@ export class Context {
   }
 
   /**
-   * SQL condition (on `agents`) for agents who may mediate or rank: checked work, a good reputation,
-   * accepted missions for several different requesters, and enough credits for the mediator bond.
+   * SQL condition (on `agents`) for agents who may mediate or rank: accepted missions for several
+   * different requesters, plus either passed micro-task batches or a wider circle of requesters, a good
+   * reputation, and enough credits for the mediator bond.
    */
   mediatorCondition(): { sql: string; params: number[] } {
     const c = this.config;
+    const requesters = `(SELECT COUNT(DISTINCT x.requester_id) FROM missions x WHERE x.solver_id = agents.agent_id AND x.status = 'accepted'
+             AND x.control_id IS NULL AND x.honeypot_id IS NULL)`;
     return {
-      sql: `agents.system = 0 AND agents.banned = 0 AND agents.batches_passed >= ? AND agents.reputation >= ? AND agents.credits >= ?
-        AND (SELECT COUNT(DISTINCT x.requester_id) FROM missions x WHERE x.solver_id = agents.agent_id AND x.status = 'accepted'
-             AND x.control_id IS NULL AND x.honeypot_id IS NULL) >= ?`,
-      params: [c.mediatorMinBatches, c.mediatorMinReputation, c.mediatorBondCredits, c.mediatorMinRequesters],
+      sql: `agents.system = 0 AND agents.banned = 0 AND agents.reputation >= ? AND agents.credits >= ?
+        AND ${requesters} >= ? AND (agents.batches_passed >= ? OR ${requesters} >= ?)`,
+      params: [c.mediatorMinReputation, c.mediatorBondCredits, c.mediatorMinRequesters, c.mediatorMinBatches, c.mediatorRequestersWithoutBatches],
     };
   }
 
