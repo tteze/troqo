@@ -1,0 +1,41 @@
+name: Surveillance de disponibilité
+
+# Toutes les 15 minutes : le marché répond, et le certificat HTTPS n'expire pas dans les 14 jours.
+# Un échec d'un workflow planifié envoie un e-mail à celui qui a modifié ce fichier en dernier
+# (réglages GitHub → Notifications → Actions). GitHub met en pause les workflows planifiés d'un
+# dépôt sans activité depuis 60 jours : il suffit alors de les réactiver dans l'onglet Actions.
+on:
+  schedule:
+    - cron: "*/15 * * * *"
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Le marché répond
+        run: |
+          for attempt in 1 2 3; do
+            code=$(curl -s -o body.json -D headers.txt -w "%{http_code}" --max-time 20 https://troqo.dev/health || true)
+            if [ "$code" = "200" ] && grep -q '"ok":true' body.json; then
+              echo "OK, version $(grep -i '^x-troqo-version' headers.txt | tr -d '\r' | cut -d' ' -f2)"
+              exit 0
+            fi
+            echo "Tentative $attempt : HTTP $code"
+            sleep 20
+          done
+          echo "::error::https://troqo.dev/health ne répond pas (HTTP $code)"
+          exit 1
+
+      - name: Le certificat HTTPS est valable plus de 14 jours
+        run: |
+          end=$(echo | openssl s_client -servername troqo.dev -connect troqo.dev:443 2>/dev/null | openssl x509 -noout -enddate | cut -d= -f2)
+          days=$(( ( $(date -d "$end" +%s) - $(date +%s) ) / 86400 ))
+          echo "Le certificat expire le $end ($days jours)"
+          if [ "$days" -lt 14 ]; then
+            echo "::error::Le certificat de troqo.dev expire dans $days jours : vérifier certbot sur le VPS"
+            exit 1
+          fi

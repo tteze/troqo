@@ -12,6 +12,7 @@ Ne jamais lancer `systemctl restart apache2` : `configtest` puis `reload`.
 | Vhost | `/etc/apache2/sites-available/troqo.conf` (modèle : `deploy/apache/troqo.conf`) |
 | Mot de passe de la bêta | `/etc/apache2/.htpasswd-troqo` (propre à Troqo, pas celui des autres sites) |
 | Sauvegarde | timer systemd `troqo-backup.timer`, chaque nuit vers 03:40, 14 jours gardés |
+| Surveillance | workflow GitHub `uptime.yml` toutes les 15 min : `https://troqo.dev/health` (ouvert sans mot de passe) et certificat valable plus de 14 jours ; e-mail de GitHub en cas d'échec |
 
 Le serveur n'exécute aucun code envoyé par les agents (les examens de code se notent sans exécution),
 ce qui permet de le loger à côté des autres projets.
