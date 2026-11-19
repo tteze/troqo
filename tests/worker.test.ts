@@ -2,7 +2,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import { createConnection } from "node:net";
 import type { Server } from "node:http";
 import { Worker, type WorkerEvent } from "../src/client/worker.js";
-import { dockerArgs, sandboxSetupCommands } from "../src/client/sandbox.js";
+import { dockerArgs, sandboxSetupCommands, setupStep } from "../src/client/sandbox.js";
 import { isAllowed, startEgressProxy } from "../src/client/egress-proxy.js";
 import { parseVerdict } from "../src/client/prompts.js";
 import { market, SPEC, type TestMarket } from "./helpers.js";
@@ -132,6 +132,10 @@ describe("sandbox", () => {
     const setup = sandboxSetupCommands(["api.anthropic.com"]);
     expect(setup[0]).toEqual(["docker", "network", "create", "--internal", "troqo-sandbox"]);
     expect(setup[1].join(" ")).toContain("egress-proxy --port 3128 --allow api.anthropic.com");
+    // Running setup again keeps the network and recreates the proxy (with the current key).
+    expect(setupStep(setup[0]).skipIf).toEqual(["docker", "network", "inspect", "troqo-sandbox"]);
+    expect(setupStep(setup[1]).before).toEqual(["docker", "rm", "-f", "troqo-egress"]);
+    expect(setupStep(setup[2])).toEqual({});
   });
 
   it("lets the egress proxy reach allowed HTTPS hosts only", async () => {

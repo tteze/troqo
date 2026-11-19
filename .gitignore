@@ -10,3 +10,7 @@ site/download/
 /troqo*.tgz
 /troqo*.tgz.sig
 !data/honeypots.sample.json
+# Local secrets: never commit
+testkey.txt
+*.pem
+!docs/release-public.pem

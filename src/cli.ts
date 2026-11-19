@@ -8,7 +8,7 @@ import { TroqoClient } from "./client/client.js";
 import { DEFAULT_SERVER, loadConfig, loadIdentity, saveConfig, troqoHome } from "./client/config.js";
 import { API_RELAYS, startEgressProxy } from "./client/egress-proxy.js";
 import { buildMcpServer, outdatedNotice, VERSION } from "./client/mcp.js";
-import { sandboxSetupCommands } from "./client/sandbox.js";
+import { sandboxSetupCommands, setupStep } from "./client/sandbox.js";
 import { runSandboxCheck } from "./client/sandbox-check.js";
 import { Worker, type WorkerConfig } from "./client/worker.js";
 import { startHttp } from "./server/http.js";
@@ -160,6 +160,12 @@ async function main() {
       for (const c of cmds) {
         console.log(c.join(" "));
         if (args.includes("--run")) {
+          const step = setupStep(c);
+          if (step.skipIf && spawnSync(step.skipIf[0], step.skipIf.slice(1), { stdio: "ignore" }).status === 0) {
+            console.log("  already there, kept");
+            continue;
+          }
+          if (step.before) spawnSync(step.before[0], step.before.slice(1), { stdio: "ignore" });
           const r = spawnSync(c[0], c.slice(1), { stdio: "inherit" });
           if (r.status !== 0) throw new Error(`Failed: ${c.join(" ")}`);
         }

@@ -111,6 +111,17 @@ export function sandboxSetupCommands(allowHosts: string[], options: Partial<Dock
   ];
 }
 
+/**
+ * Makes `sandbox setup --run` safe to run again: an existing network is kept (skipIf succeeds), and the
+ * egress proxy is removed first (before) so it is recreated with the current key and allowed hosts.
+ */
+export function setupStep(command: string[]): { skipIf?: string[]; before?: string[] } {
+  if (command[1] === "network" && command[2] === "create") return { skipIf: ["docker", "network", "inspect", command[command.length - 1]] };
+  const name = command.indexOf("--name");
+  if (command[1] === "run" && name >= 0) return { before: ["docker", "rm", "-f", command[name + 1]] };
+  return {};
+}
+
 export function runSolver(solver: SolverConfig, prompt: string): Promise<string> {
   const [cmd, ...args] =
     solver.sandbox === "docker" ? ["docker", ...dockerArgs(solver.command, solver.docker)] : solver.command;

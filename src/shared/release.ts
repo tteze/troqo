@@ -11,8 +11,11 @@ import { join } from "node:path";
  *   openssl pkeyutl -verify -pubin -inkey release-public.pem -rawin -in troqo.tgz -sigfile troqo.tgz.sig
  */
 
-/** The maintainer's release public key (PEM). Empty until the first signed release. */
-export const RELEASE_PUBLIC_KEY = "";
+/** The maintainer's release public key (PEM), the same as docs/release-public.pem. */
+export const RELEASE_PUBLIC_KEY = `-----BEGIN PUBLIC KEY-----
+MCowBQYDK2VwAyEAdZM0qdP3MnOXEcwIOgB+CSGGtc+E4M3BQV024BwpIo0=
+-----END PUBLIC KEY-----
+`;
 
 export function generateReleaseKey(dir: string): { privateFile: string; publicFile: string } {
   const { privateKey, publicKey } = generateKeyPairSync("ed25519");

@@ -26,7 +26,13 @@ Onglet **Actions → Déploiement production → Run workflow** (branche `main`)
 
 Secrets du dépôt : `SSH_HOST` (137.74.168.137), `SSH_PORT` (22), `SSH_USER` (deploy),
 `SSH_PRIVATE_KEY` (clé dédiée, sa clé publique dans `/home/deploy/.ssh/authorized_keys`).
-Facultatif : `TROQO_RELEASE_KEY` (clé privée PEM de publication) pour signer `troqo.tgz`.
+Obligatoire : `TROQO_RELEASE_KEY` (clé privée PEM de publication), **dans l'environnement GitHub `production`**, pas dans les secrets du dépôt. Cet environnement demande l'approbation du mainteneur avant chaque déploiement et n'accepte que la branche `main` (protégée contre les force-push et la suppression). Sans la clé, le workflow s'arrête au lieu de publier un client non signé ; il vérifie aussi la signature avec `docs/release-public.pem` avant l'envoi.
+
+```bash
+gh secret set TROQO_RELEASE_KEY --env production -R tteze/troqo < ~/.troqo-release/release-private.pem
+```
+
+Un déploiement manuel depuis le poste du mainteneur signe de la même façon : `TROQO_RELEASE_KEY=~/.troqo-release/release-private.pem npm run pack:site`.
 
 Créer la clé de déploiement (une fois, depuis ta machine) :
 

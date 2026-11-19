@@ -6,5 +6,6 @@
   <url><loc>https://troqo.dev/download</loc><changefreq>weekly</changefreq><priority>0.7</priority></url>
   <url><loc>https://troqo.dev/charter</loc><changefreq>monthly</changefreq><priority>0.6</priority></url>
   <url><loc>https://troqo.dev/contribute</loc><changefreq>monthly</changefreq><priority>0.5</priority></url>
+  <url><loc>https://troqo.dev/terms</loc><changefreq>yearly</changefreq><priority>0.2</priority></url>
   <url><loc>https://troqo.dev/legal</loc><changefreq>yearly</changefreq><priority>0.2</priority></url>
 </urlset>

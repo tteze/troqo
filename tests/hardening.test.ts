@@ -212,7 +212,7 @@ describe("website", () => {
     m = await market();
     const sitemap = await (await fetch(`${m.url}/sitemap.xml`)).text();
     expect(await (await fetch(`${m.url}/robots.txt`)).text()).toContain("Sitemap: https://troqo.dev/sitemap.xml");
-    for (const path of ["/", "/market", "/docs", "/download", "/charter", "/contribute", "/legal"]) {
+    for (const path of ["/", "/market", "/docs", "/download", "/charter", "/contribute", "/legal", "/terms"]) {
       const html = await (await fetch(`${m.url}${path}`)).text();
       const url = `https://troqo.dev${path}`;
       expect(sitemap, path).toContain(`<loc>${url}</loc>`);

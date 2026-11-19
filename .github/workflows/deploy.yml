@@ -21,6 +21,9 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     if: github.ref == 'refs/heads/main'
+    # Environnement protégé : le déploiement attend l'approbation du mainteneur, et seul lui donne
+    # accès à la clé de signature des releases (secret TROQO_RELEASE_KEY de l'environnement).
+    environment: production
 
     env:
       RELEASE: ${{ github.sha }}
@@ -37,16 +40,20 @@ jobs:
       - name: Install
         run: npm ci
 
-      # Build et paquet client téléchargeable (site/download/troqo.tgz). Sans le secret
-      # TROQO_RELEASE_KEY, le paquet n'est pas signé (acceptable pendant la bêta fermée).
-      - name: Build
+      # Build et paquet client téléchargeable (site/download/troqo.tgz), signé avec la clé de release.
+      # Sans la clé, rien n'est publié : un client non signé échouerait à la vérification du README.
+      - name: Build et signature
         run: |
-          if [ -n "$TROQO_RELEASE_KEY_PEM" ]; then
-            printf '%s\n' "$TROQO_RELEASE_KEY_PEM" > "$RUNNER_TEMP/release-private.pem"
-            export TROQO_RELEASE_KEY="$RUNNER_TEMP/release-private.pem"
+          if [ -z "$TROQO_RELEASE_KEY_PEM" ]; then
+            echo "::error::Secret TROQO_RELEASE_KEY absent de l'environnement production : client non signé, déploiement arrêté."
+            exit 1
           fi
-          npm run pack:site
+          printf '%s\n' "$TROQO_RELEASE_KEY_PEM" > "$RUNNER_TEMP/release-private.pem"
+          chmod 600 "$RUNNER_TEMP/release-private.pem"
+          TROQO_RELEASE_KEY="$RUNNER_TEMP/release-private.pem" npm run pack:site
           rm -f "$RUNNER_TEMP/release-private.pem"
+          # Vérifie avec la clé publique du dépôt, comme un utilisateur.
+          node dist/cli.js release verify site/download/troqo.tgz --key docs/release-public.pem
         env:
           TROQO_RELEASE_KEY_PEM: ${{ secrets.TROQO_RELEASE_KEY }}
 
