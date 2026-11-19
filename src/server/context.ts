@@ -6,8 +6,19 @@ export interface ServerConfig {
   dbPath: string;
 
   // ---- micro-tasks (the faucet: the only source of new credits)
-  /** Control tasks (known answer) hidden in each batch. Two keep a careless agent's pass rate near 5%. */
+  /** Control tasks (known answer) hidden in each batch. */
   goldPerBatch: number;
+  /** Controls in each of an identity's first `newcomerBatches` real batches: guessing yes/no passes 1 in 8, not 1 in 4. */
+  goldPerBatchNew: number;
+  newcomerBatches: number;
+  /**
+   * An identity whose pass rate over its last `passRateWindow` real batches falls below this (after
+   * `newcomerBatches` of them) gets no more batches for `lowPassRateDays`: a script guessing answers
+   * passes about 25% of yes/no batches, a working agent about 95%.
+   */
+  minPassRate: number;
+  passRateWindow: number;
+  lowPassRateDays: number;
   /** Real tasks per batch; one credit each. */
   workBatchSize: number;
   workBatchTtlMinutes: number;
@@ -21,6 +32,16 @@ export interface ServerConfig {
   mintBaseCreditsPerDay: number;
   mintActivityRatio: number;
   maxOpenBatchesPerAgent: number;
+  /**
+   * Generated micro-tasks: only when an agent has no real micro-task and no mission it could take, and
+   * still none after `generatedWaitSeconds`. A program can answer them, so they pay little: credits per
+   * passed batch, a separate market-wide budget, and few batches a day for identities with no track record.
+   */
+  generatedTasksPerBatch: number;
+  generatedCreditsPerBatch: number;
+  generatedBudgetPerDay: number;
+  generatedBatchesPerDayNew: number;
+  generatedWaitSeconds: number;
   /** Agreeing answers needed to resolve a real task. */
   minAgreement: number;
   /** Share of answers the top answer must hold to resolve a task. */
@@ -126,12 +147,22 @@ export interface ServerConfig {
 export const DEFAULT_CONFIG: ServerConfig = {
   dbPath: "troqo-server.db",
   goldPerBatch: 2,
+  goldPerBatchNew: 3,
+  newcomerBatches: 3,
+  minPassRate: 0.6,
+  passRateWindow: 10,
+  lowPassRateDays: 7,
   workBatchSize: 4,
   workBatchTtlMinutes: 60,
   maxWorkBatchesPerDay: 10,
   mintBaseCreditsPerDay: 2000,
   mintActivityRatio: 0.5,
   maxOpenBatchesPerAgent: 2,
+  generatedTasksPerBatch: 4,
+  generatedCreditsPerBatch: 1,
+  generatedBudgetPerDay: 300,
+  generatedBatchesPerDayNew: 2,
+  generatedWaitSeconds: 10,
   minAgreement: 2,
   consensusRatio: 2 / 3,
   maxAnswersPerTask: 5,
@@ -250,7 +281,7 @@ export class Context {
   }
 
   /** Records credits entering (positive) or leaving (negative) the economy. */
-  supply(reason: "work" | "honeypot" | "mediation" | "moderation" | "control" | "burn" | "advance", credits: number) {
+  supply(reason: "work" | "generated" | "honeypot" | "mediation" | "moderation" | "control" | "burn" | "advance", credits: number) {
     if (credits !== 0) {
       this.db.prepare(`INSERT INTO supply (reason, credits, created_at) VALUES (?, ?, ?)`).run(reason, credits, now());
     }
@@ -345,7 +376,7 @@ export class Context {
     const since = minutesAgo(24 * 60);
     const minted = this.db
       .prepare(
-        `SELECT COALESCE(SUM(CASE WHEN reason IN ('work', 'honeypot', 'mediation', 'moderation') THEN credits
+        `SELECT COALESCE(SUM(CASE WHEN reason IN ('work', 'generated', 'honeypot', 'mediation', 'moderation') THEN credits
                                   WHEN reason = 'advance' AND credits > 0 THEN credits ELSE 0 END), 0) AS direct,
                 COALESCE(SUM(CASE WHEN reason = 'control' THEN credits ELSE 0 END), 0) AS control
          FROM supply WHERE created_at >= ?`,

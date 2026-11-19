@@ -2,7 +2,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { generateIdentity, signBoxKey, signRequest } from "../src/shared/crypto.js";
 import { leadingZeroBits, solvePow, verifyPow } from "../src/shared/pow.js";
 import { addressKey } from "../src/server/http.js";
-import { backdate, market, SPEC, type TestMarket } from "./helpers.js";
+import { backdate, bank, market, SPEC, type TestMarket } from "./helpers.js";
 
 let m: TestMarket;
 afterEach(() => m?.close());
@@ -162,7 +162,8 @@ describe("start-up advance", () => {
       const b = await a.earnCredits();
       await a.submitWork(b.batchId, allYes(b.tasks));
     }
-    await expect(a.earnCredits()).rejects.toMatchObject({ code: "task_pool_exhausted" });
+    // No real task left: the market first asks to wait a few seconds before generated tasks.
+    await expect(a.earnCredits()).rejects.toMatchObject({ code: "no_work_yet" });
   };
 
   it("lets an agent with no micro-task left post beyond its balance, then repays from what it earns", async () => {
@@ -344,5 +345,110 @@ describe("lessons from the market simulation", () => {
     expect(code.pairs30d).toBe(15);
     expect(code.avgAcceptedPrice).toBe(7); // the median of the pairs, not pulled toward 60
     expect(code.models.map((x) => x.model)).toEqual(["model-a"]); // the ring's requesters paid only one solver each
+  });
+});
+
+describe("generated micro-tasks, a last resort", () => {
+  const empty = (config = {}) => market({ generatedWaitSeconds: 0, ...config }).then((t) => (t.troqo.ctx.db.exec(`DELETE FROM tasks`), t));
+  const answers = (t: TestMarket, batchId: string, right = true) =>
+    (t.troqo.ctx.db.prepare(`SELECT task_id, expected FROM assignments WHERE batch_id = ?`).all(batchId) as { task_id: string; expected: string }[]).map((r) => ({
+      taskId: r.task_id,
+      answer: right ? r.expected : "certainly not an option",
+    }));
+
+  it("come only after a few seconds without any real work, and pay one credit per batch", async () => {
+    m = await market({ generatedWaitSeconds: 60 });
+    m.troqo.ctx.db.exec(`DELETE FROM tasks`);
+    const a = await m.agent();
+    await expect(a.earnCredits()).rejects.toMatchObject({ code: "no_work_yet" });
+    await expect(a.earnCredits()).rejects.toMatchObject({ code: "no_work_yet" }); // still within the wait
+    await m.close();
+
+    m = await empty();
+    const b = await m.agent();
+    await expect(b.earnCredits()).rejects.toMatchObject({ code: "no_work_yet" });
+    const batch = await b.earnCredits();
+    expect(batch.generated).toBe(true);
+    expect(batch.tasks).toHaveLength(4);
+    const r = await b.submitWork(batch.batchId, answers(m, batch.batchId).map((x) => ({ ...x, answer: x.answer })));
+    expect(r).toMatchObject({ passed: true, creditsEarned: 1 });
+    const acc = await b.account();
+    expect(acc.batchesPassed).toBe(0); // no track record from generated tasks
+    expect(acc.reputation).toBeNull();
+    expect(m.troqo.market.stats().credits.created).toMatchObject({ generated: 1 });
+  });
+
+  it("are refused while a mission the agent could take is open", async () => {
+    m = await empty();
+    const req = await m.agent(20);
+    const p = await req.postMission({ ...SPEC, priceCredits: 3 });
+    await req.postMission({ ...SPEC, priceCredits: 3, model: "other-model" }); // not takeable by this agent
+    const a = await m.agent();
+    await expect(a.earnCredits()).rejects.toMatchObject({ code: "work_available" });
+    await req.cancelMission(p.missionId);
+    await expect(a.earnCredits()).rejects.toMatchObject({ code: "no_work_yet" });
+    expect((await a.earnCredits()).generated).toBe(true);
+  });
+
+  it("limit new identities, keep a small market-wide budget and never become controls of real batches", async () => {
+    m = await empty({ generatedBudgetPerDay: 3, generatedBatchesPerDayNew: 2 });
+    const a = await m.agent();
+    for (let i = 0; i < 2; i++) {
+      await a.earnCredits().catch(() => undefined); // the first ask waits
+      const b = await a.earnCredits();
+      await a.submitWork(b.batchId, answers(m, b.batchId));
+    }
+    await expect(a.earnCredits()).rejects.toMatchObject({ code: "daily_work_limit" });
+    const other = await m.agent();
+    await other.earnCredits().catch(() => undefined);
+    const wrong = await other.earnCredits();
+    expect((await other.submitWork(wrong.batchId, answers(m, wrong.batchId).map((x) => ({ ...x, answer: JSON.parse((m.troqo.ctx.db.prepare(`SELECT options FROM tasks WHERE id = ?`).get(x.taskId) as { options: string }).options).find((o: string) => o !== x.answer) })))).creditsEarned).toBe(0);
+    await other.earnCredits().catch(() => undefined);
+    await other.submitWork((await other.earnCredits()).batchId, []).catch(() => undefined); // abandoned
+    const third = await m.agent();
+    await third.earnCredits().catch(() => undefined);
+    await expect(third.earnCredits()).rejects.toMatchObject({ code: "faucet_dry" }); // 2 earned + 1 reserved = 3
+
+    // A real bank arrives: its batches use real controls only, never generated tasks.
+    m.troqo.work.loadTasks(bank(8, 4));
+    const real = await (await m.agent()).earnCredits();
+    expect(real.generated).toBeUndefined();
+    expect(real.tasks.every((t) => !t.taskId.startsWith("gen-"))).toBe(true);
+  });
+
+  it("always have their right answer among distinct options", async () => {
+    const { MICROTASK_GENERATORS } = await import("../src/server/microtasks.js");
+    for (const g of MICROTASK_GENERATORS) {
+      for (let i = 0; i < 50; i++) {
+        const t = g();
+        expect(t.options).toContain(t.answer);
+        expect(new Set(t.options).size).toBe(t.options.length);
+      }
+    }
+  });
+});
+
+describe("scripts guessing micro-task answers", () => {
+  it("put more controls in a new identity's first batches, then cut identities that fail too often", async () => {
+    m = await market({ goldPerBatchNew: 3, newcomerBatches: 3, minPassRate: 0.6, passRateWindow: 10, lowPassRateDays: 7 });
+    m.troqo.work.loadTasks(bank(40, 30).map((t) => (t.id.startsWith("g") ? { ...t, id: `x${t.id}` } : t)));
+    const guess = await m.agent();
+    const wrong = (tasks: { taskId: string }[]) => tasks.map((t) => ({ taskId: t.taskId, answer: "no" })); // controls expect "yes"
+    for (let i = 0; i < 3; i++) {
+      const b = await guess.earnCredits();
+      expect(b.tasks).toHaveLength(4 + 3); // three controls while new
+      expect((await guess.submitWork(b.batchId, wrong(b.tasks))).passed).toBe(false);
+    }
+    await expect(guess.earnCredits()).rejects.toMatchObject({ code: "low_pass_rate" });
+    backdate(m, `UPDATE batches SET completed_at = ? WHERE agent_id = ?`, guess.agentId);
+    expect((await guess.earnCredits()).tasks).toHaveLength(4 + 2); // a week later it may try again
+
+    const honest = await m.agent();
+    for (let i = 0; i < 4; i++) {
+      const b = await honest.earnCredits();
+      expect(b.tasks).toHaveLength(i < 3 ? 7 : 6);
+      const right = b.tasks.map((t) => ({ taskId: t.taskId, answer: t.taskId.includes("g") ? "yes" : "no" }));
+      expect((await honest.submitWork(b.batchId, right)).passed).toBe(true);
+    }
   });
 });

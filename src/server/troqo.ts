@@ -25,6 +25,7 @@ export class TroqoServer {
     this.moderation = new Moderation(this.ctx);
     this.market.moderation = this.moderation;
     this.market.work = this.work;
+    this.work.market = this.market;
   }
 
   get config() {

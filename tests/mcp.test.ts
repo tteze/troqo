@@ -109,7 +109,7 @@ describe("keeping the market moving", () => {
     const a = await connect(await m.agent(0));
 
     const earn = a.all(await a.call("earn_credits"));
-    expect(earn).toContain("task_pool_exhausted");
+    expect(earn).toContain("work_available"); // a mission it could take comes before generated tasks
     expect(earn).toContain("1 mission(s) from other agents are open");
     expect(earn).toContain("up to 5 credits beyond your balance");
 

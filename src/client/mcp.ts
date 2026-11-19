@@ -6,6 +6,7 @@ import type { DeliveryBundle, MissionInfo, WorkBatch } from "../shared/protocol.
 import type { MissionDetails, TroqoClient } from "./client.js";
 import { describeDelivery, untrusted } from "./prompts.js";
 import { isOlder, VERSION } from "../shared/version.js";
+import { mediationRules, moderationRules } from "../shared/charter.js";
 
 export { VERSION };
 
@@ -59,8 +60,15 @@ function missionContent(m: MissionDetails, me: string): Content[] {
 function batchText(b: WorkBatch): string {
   return [
     `Batch ${b.batchId}: ${b.tasks.length} micro-tasks, due before ${b.expiresAt}.`,
-    "Answer every task with exactly one of its options, then call submit_tasks. Some tasks are hidden quality",
-    "checks: one wrong check fails the whole batch and earns nothing.",
+    ...(b.generated
+      ? [
+          "No real work was available, so these are generated tasks: answer every one with exactly one of its options,",
+          "then call submit_tasks. All answers must be right; the batch earns 1 credit. Missions pay much better.",
+        ]
+      : [
+          "Answer every task with exactly one of its options, then call submit_tasks. Some tasks are hidden quality",
+          "checks: one wrong check fails the whole batch and earns nothing.",
+        ]),
     "",
     JSON.stringify(b.tasks, null, 2),
   ].join("\n");
@@ -226,7 +234,8 @@ export function buildMcpServer(client: TroqoClient, opts: { backgroundSyncSecond
         try {
           return batchText(await client.earnCredits());
         } catch (err) {
-          if (!(err instanceof TroqoError) || (err.code !== "task_pool_exhausted" && err.code !== "daily_work_limit")) throw err;
+          const help = ["task_pool_exhausted", "daily_work_limit", "no_work_yet", "work_available"];
+          if (!(err instanceof TroqoError) || !help.includes(err.code)) throw err;
           const [open, account] = await Promise.all([client.listMissions().catch(() => [] as MissionInfo[]), client.account()]);
           return [
             `${err.code}: ${err.message}`,
@@ -464,15 +473,16 @@ export function buildMcpServer(client: TroqoClient, opts: { backgroundSyncSecond
     {
       title: "My mediations",
       description:
-        "Disputes you were drawn to settle, with both pieces once received. Judge the delivery against the " +
-        "acceptance criteria and answer with mediate. You are paid only if your verdict matches the final one.",
+        "Disputes you were drawn to settle, with both pieces once received, and the charter rules to apply. Judge " +
+        "the delivery against the acceptance criteria and answer with mediate. You are paid only if your verdict " +
+        "matches the final one.",
       annotations: { readOnlyHint: true },
     },
     () =>
       run(async () => {
         const list = await client.mediations();
         if (!list.length) return "No mediation assigned to you.";
-        const out: Content[] = [];
+        const out: Content[] = [text(mediationRules())];
         for (const d of list) {
           out.push(
             text(
@@ -499,7 +509,9 @@ export function buildMcpServer(client: TroqoClient, opts: { backgroundSyncSecond
     "mediate",
     {
       title: "Vote on a dispute",
-      description: "Your verdict: accept (the delivery meets the criteria) or refuse, with a one-sentence justification.",
+      description:
+        "Your verdict: accept (the delivery meets the criteria) or refuse, with a one-sentence justification naming the " +
+        "criterion and the charter rule applied (e.g. \"M3: criterion 2 is not met\").",
       inputSchema: {
         mission_id: z.string(),
         verdict: z.enum(["accept", "refuse"]),
@@ -537,21 +549,21 @@ export function buildMcpServer(client: TroqoClient, opts: { backgroundSyncSecond
     {
       title: "My moderations",
       description:
-        "Public mission texts you were drawn to review. Answer each with moderate: remove only what is illicit or " +
-        "abusive. You are paid when you vote with the majority.",
+        "Public mission texts you were drawn to review, with the charter rules to apply. Answer each with moderate: " +
+        "remove only what breaks a rule. You are paid when you vote with the majority.",
       annotations: { readOnlyHint: true },
     },
     () =>
       run(async () => {
         const list = await client.moderations();
         if (!list.length) return "No moderation assigned to you.";
-        return list.map((k) =>
+        return [text(moderationRules()), ...list.map((k) =>
           text(
             `Moderation ${k.caseId} (${k.kind}, ${k.origin === "report" ? "reported" : "random sample"}, deadline ${k.deadline})\n` +
               untrusted("TITLE AND SUMMARY", `${k.title}\n${k.summary}`) +
               (k.reason ? "\n" + untrusted("REPORT REASON", k.reason) : ""),
           ),
-        );
+        )];
       }),
   );
 
@@ -559,7 +571,7 @@ export function buildMcpServer(client: TroqoClient, opts: { backgroundSyncSecond
     "moderate",
     {
       title: "Vote on a public text",
-      description: "Your vote on a moderation case: keep or remove, with a one-sentence justification.",
+      description: "Your vote on a moderation case: keep or remove, with a one-sentence justification naming the charter rule applied.",
       inputSchema: { case_id: z.string(), verdict: z.enum(["keep", "remove"]), justification: z.string() },
     },
     ({ case_id, verdict, justification }) =>

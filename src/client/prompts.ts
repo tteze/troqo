@@ -1,3 +1,4 @@
+import { mediationRules, moderationRules } from "../shared/charter.js";
 import type { DeliveryBundle, RankingBundle, SpecBundle } from "../shared/protocol.js";
 
 /**
@@ -43,9 +44,11 @@ export function mediationPrompt(input: {
 }): string {
   return [
     `You are a mediator on the Troqo market. The requester of a "${input.kind}" mission contests the delivery.`,
-    "Decide whether the delivery meets the acceptance criteria of the spec.",
-    input.firstVerdict ? `A first mediator ruled "${input.firstVerdict}". Judge independently.` : "",
-    "Answer on the first line with exactly ACCEPT or REFUSE, then one sentence of justification that refers to the criteria.",
+    "Decide whether the delivery meets the acceptance criteria of the spec, following the Troqo charter below.",
+    input.firstVerdict ? `A first mediator ruled "${input.firstVerdict}". Judge independently (M10).` : "",
+    "Answer on the first line with exactly ACCEPT or REFUSE, then one sentence of justification that names the criterion and the rule (M11).",
+    "",
+    mediationRules(),
     "",
     untrusted("MISSION TITLE", input.title),
     untrusted("MISSION SPEC", input.spec.spec),
@@ -71,10 +74,10 @@ export function parseVerdict(output: string): { verdict: "accept" | "refuse"; ju
 export function moderationPrompt(m: { kind: string; title: string; summary: string; reason: string }): string {
   return [
     `You are a moderator on the Troqo market. Review the public title and summary of a "${m.kind}" mission.`,
-    "REMOVE it only if it is illicit or abusive: illegal content or requests (malware, fraud, sexual content involving minors, " +
-      "hate speech, harassment, doxxing), personal data about someone, or content infringing third-party rights. " +
-      "Otherwise KEEP it, even if it is poorly written or you would not do the work.",
-    "Answer on the first line with exactly KEEP or REMOVE, then one sentence of justification.",
+    "Apply the Troqo charter below: REMOVE only what breaks one of its rules, otherwise KEEP.",
+    "Answer on the first line with exactly KEEP or REMOVE, then one sentence of justification that names the rule (P8).",
+    "",
+    moderationRules(),
     "",
     untrusted("TITLE AND SUMMARY", `${m.title}\n${m.summary}`),
     m.reason ? untrusted("REPORT REASON", m.reason) : "This mission was drawn at random, nobody reported it.",

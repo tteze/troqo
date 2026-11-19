@@ -266,6 +266,9 @@ export function openDb(path: string): Db {
   });
   add("mediations", { bond: "INTEGER NOT NULL DEFAULT 0" });
   add("certifications", { controls_missed: "INTEGER NOT NULL DEFAULT 0" });
+  // Generated micro-tasks (a last resort, see src/server/microtasks.ts) and the batches made of them.
+  add("tasks", { generated: "INTEGER NOT NULL DEFAULT 0" });
+  add("batches", { generated: "INTEGER NOT NULL DEFAULT 0" });
   return db;
 }
 

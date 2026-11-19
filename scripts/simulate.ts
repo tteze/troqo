@@ -84,7 +84,8 @@ type Cohort =
   | "whitewasher"
   | "advance-abuser"
   | "wash-trader"
-  | "squatter";
+  | "squatter"
+  | "bot-farm";
 interface Agent {
   c: Client;
   cohort: Cohort;
@@ -124,9 +125,23 @@ const QUALITY: Record<string, number> = { "model-a": 0.95, "model-b": 0.8 };
 
 async function microTasks(a: Agent, batches: number, honest = true) {
   for (let i = 0; i < batches; i++) {
-    const b = await attempt(() => a.c.earnCredits());
-    if (!b) return;
-    const answers = b.tasks.map((t) => ({ taskId: t.taskId, answer: honest ? truth(Number(t.input.slice(2))) : pick(["yes", "no"]) }));
+    let b = await a.c.earnCredits().catch((e) => e as Error & { code?: string });
+    if ((b as { code?: string }).code === "no_work_yet") {
+      advance(0.2); // the market asks to wait a few seconds for real work before generated tasks
+      b = await a.c.earnCredits().catch((e) => e as Error & { code?: string });
+    }
+    if (b instanceof Error) {
+      note(b);
+      return;
+    }
+    // Real tasks: honest agents know the truth. Generated ones: a capable agent (or a script) answers right.
+    const expected = new Map(
+      (db.prepare(`SELECT task_id, expected FROM assignments WHERE batch_id = ?`).all(b.batchId) as { task_id: string; expected: string | null }[]).map((r) => [r.task_id, r.expected]),
+    );
+    const answers = b.tasks.map((t) => ({
+      taskId: t.taskId,
+      answer: b.generated ? expected.get(t.taskId)! : honest ? truth(Number(t.input.slice(2))) : pick(["yes", "no"]),
+    }));
     await attempt(() => a.c.submitWork(b.batchId, answers));
   }
 }
@@ -218,6 +233,8 @@ async function arrivals(day: number) {
   for (const [cohort, n, model] of want) for (let i = 0; i < n; i++) await join_(cohort, model);
   // Advance abusers: two fresh identities a day, each posting one mission on an advance and vanishing.
   if (day >= 1) for (let i = 0; i < 2; i++) await join_("advance-abuser");
+  // A bot farm: five fresh scripted identities a day that only farm generated tasks.
+  if (day >= 1) for (let i = 0; i < 5; i++) await join_("bot-farm");
 }
 
 // ---- run
@@ -284,6 +301,9 @@ for (let day = 0; day < DAYS; day++) {
         }
         case "squatter":
           await solve(a, { deliver: false });
+          break;
+        case "bot-farm":
+          await microTasks(a, 3, false); // a script: right on generated tasks, guessing on real ones
           break;
       }
     }
@@ -413,6 +433,11 @@ const out = [
   JSON.stringify(supply, null, 2),
   "```",
   `Advance credits never repaid: ${supply.advance ?? 0}.`,
+  `Bot farm: ${agents.filter((a) => a.cohort === "bot-farm").length} scripted identities hold ${
+    (db
+      .prepare(`SELECT COALESCE(SUM(credits), 0) AS c FROM agents WHERE agent_id IN (${agents.filter((a) => a.cohort === "bot-farm").map(() => "?").join(",") || "''"})`)
+      .get(...agents.filter((a) => a.cohort === "bot-farm").map((a) => a.c.agentId)) as { c: number }).c
+  } credits; generated tasks created ${supply.generated ?? 0} credits in all.`,
   "",
   "## Going rate",
   table(rates.map((r) => ({ kind: r.kind, avgAcceptedPrice: r.avgAcceptedPrice, pairs30d: r.pairs30d, accepted30d: r.accepted30d, models: r.models.map((m) => `${m.model} ${m.avgAcceptedPrice} (${m.pairs30d} pairs)`).join(", ") || "–" }))),

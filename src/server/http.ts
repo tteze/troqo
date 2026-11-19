@@ -1,5 +1,6 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { VERSION } from "../shared/version.js";
+import { renderMarkdown } from "./markdown.js";
 import { readFile, stat } from "node:fs/promises";
 import { timingSafeEqual } from "node:crypto";
 import { dirname, extname, join, normalize, sep } from "node:path";
@@ -62,7 +63,8 @@ class HttpError extends Error {
 function statusFor(code: string): number {
   if (code === "forbidden") return 403;
   if (code.startsWith("unknown_")) return 404;
-  if (code === "faucet_dry") return 429;
+  if (code === "faucet_dry" || code === "no_work_yet") return 429;
+  if (code === "work_available") return 409;
   if (code === "certification_required") return 403;
   if (code === "too_many_reports") return 429;
   if (code === "already_reported" || code === "already_removed" || code === "appeal_unavailable") return 409;
@@ -335,6 +337,9 @@ export function startHttp(troqo: TroqoServer, opts: HttpOptions): Promise<Server
         if (path === "/api.md" || path === "/llms.txt") {
           if (await serveFile(res, docsFile)) return;
         }
+        if (path === "/charter.md") {
+          if (await serveFile(res, join(dirname(docsFile), "CHARTER.md"))) return;
+        }
         if (path === "/admin/stats" || path === "/admin/export" || path === "/admin/moderation") {
           requireAdmin(req);
           if (path === "/admin/moderation") return send(res, 200, troqo.moderation.cases(url.searchParams.get("status") ?? "operator"));
@@ -397,6 +402,17 @@ export function startHttp(troqo: TroqoServer, opts: HttpOptions): Promise<Server
           rel = decodeURIComponent(path);
         } catch {
           throw new HttpError(400, "bad_path", "Malformed URL");
+        }
+        // The charter page is rendered from docs/CHARTER.md, so the site and the repository never differ.
+        if (rel === "/charter" || rel === "/charter.html") {
+          try {
+            const [template, md] = await Promise.all([readFile(join(siteDir, "charter.html"), "utf8"), readFile(join(dirname(docsFile), "CHARTER.md"), "utf8")]);
+            const html = template.replace("<!-- CHARTER -->", renderMarkdown(md));
+            res.writeHead(200, { "content-type": "text/html; charset=utf-8", "cache-control": "public, max-age=300" }).end(req.method === "HEAD" ? undefined : html);
+            return;
+          } catch {
+            // fall through to a 404
+          }
         }
         if (rel.endsWith("/")) rel += "index.html";
         if (!extname(rel)) rel += ".html";

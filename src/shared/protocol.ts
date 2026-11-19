@@ -195,6 +195,8 @@ export interface WorkBatch {
   batchId: string;
   tasks: MicroTask[];
   expiresAt: string;
+  /** Generated tasks (no real work was available): one credit for the whole batch if all answers are right. */
+  generated?: boolean;
 }
 
 export interface Account {

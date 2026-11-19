@@ -3,6 +3,8 @@ import { tx } from "./db.js";
 import { check, Context, minutesAgo, now, plusMinutes } from "./context.js";
 import { TroqoError } from "../shared/errors.js";
 import type { MicroTask, WorkBatch } from "../shared/protocol.js";
+import type { Market } from "./market.js";
+import { generateMicrotask } from "./microtasks.js";
 
 /** A micro-task definition from the operator's bank. Tasks with `gold` are hidden controls. */
 export interface TaskDefinition {
@@ -56,6 +58,11 @@ export interface WorkOutcome {
  * one credit per real task; this is the only way credits enter the economy.
  */
 export class Work {
+  /** Set by TroqoServer: generated tasks are only for agents with no mission they could take. */
+  market?: Market;
+  /** When each agent first found no work: generated tasks wait a few seconds for real work to appear. */
+  private readonly emptySince = new Map<string, number>();
+
   constructor(private readonly c: Context) {}
 
   loadTasks(tasks: TaskDefinition[]): number {
@@ -76,7 +83,7 @@ export class Work {
   }
 
   taskCount(): number {
-    return (this.c.db.prepare(`SELECT COUNT(*) AS n FROM tasks`).get() as { n: number }).n;
+    return (this.c.db.prepare(`SELECT COUNT(*) AS n FROM tasks WHERE generated = 0`).get() as { n: number }).n;
   }
 
   private pickRealTasks(agentId: string, count: number): BatchRow[] {
@@ -100,7 +107,7 @@ export class Work {
     return this.c.db
       .prepare(
         `SELECT * FROM (
-           SELECT t.*, t.gold AS expected, 0 AS derived FROM tasks t WHERE t.gold IS NOT NULL
+           SELECT t.*, t.gold AS expected, 0 AS derived FROM tasks t WHERE t.gold IS NOT NULL AND t.generated = 0
            UNION ALL
            SELECT t.*, v.answer AS expected, 1 AS derived FROM tasks t
            JOIN (SELECT task_id, answer, COUNT(*) AS n FROM answers WHERE accepted = 1
@@ -123,7 +130,12 @@ export class Work {
 
   /** Credits held back by batches still open. */
   reservedCredits(): number {
-    return (this.c.db.prepare(`SELECT COUNT(*) AS n FROM batches WHERE status = 'awaiting_work'`).get() as { n: number }).n * this.c.config.workBatchSize;
+    const cfg = this.c.config;
+    return (
+      this.c.db
+        .prepare(`SELECT COALESCE(SUM(CASE WHEN generated = 1 THEN ? ELSE ? END), 0) AS n FROM batches WHERE status = 'awaiting_work'`)
+        .get(cfg.generatedCreditsPerBatch, cfg.workBatchSize) as { n: number }
+    ).n;
   }
 
   /** Why this agent cannot open a micro-task batch right now (an error code), or null if it can. */
@@ -161,9 +173,24 @@ export class Work {
       `The market created its ${budget} credits of the last 24 hours. Solve a mission or mediate, or come back later.`,
     );
 
+    // Guessing: an identity that fails too many real batches gets none for a while.
+    const recent = this.c.db
+      .prepare(
+        `SELECT status, completed_at FROM batches WHERE agent_id = ? AND generated = 0 AND status IN ('passed', 'failed')
+         ORDER BY completed_at DESC LIMIT ?`,
+      )
+      .all(agentId, cfg.passRateWindow) as { status: string; completed_at: string }[];
+    const passRate = recent.filter((b) => b.status === "passed").length / Math.max(1, recent.length);
+    check(
+      recent.length < cfg.newcomerBatches || passRate >= cfg.minPassRate || recent[0].completed_at < minutesAgo(cfg.lowPassRateDays * 24 * 60),
+      "low_pass_rate",
+      `Only ${Math.round(passRate * 100)}% of your last ${recent.length} batches passed their checks: no more micro-tasks for ` +
+        `${cfg.lowPassRateDays} days after the last one. Solve missions instead.`,
+    );
+    const goldCount = recent.length < cfg.newcomerBatches ? cfg.goldPerBatchNew : cfg.goldPerBatch;
     const real = this.pickRealTasks(agentId, cfg.workBatchSize);
-    const gold = this.pickGoldTasks(agentId, cfg.goldPerBatch);
-    if (real.length < cfg.workBatchSize || gold.length < cfg.goldPerBatch) {
+    const gold = this.pickGoldTasks(agentId, goldCount);
+    if (real.length < cfg.workBatchSize || gold.length < goldCount) {
       throw new TroqoError("task_pool_exhausted", "No micro-tasks available for you right now");
     }
     return { real, gold };
@@ -171,7 +198,15 @@ export class Work {
 
   openBatch(agentId: string): WorkBatch {
     const cfg = this.c.config;
-    const { real, gold } = this.checkBatch(agentId);
+    let picked: { real: BatchRow[]; gold: BatchRow[] };
+    try {
+      picked = this.checkBatch(agentId);
+    } catch (e) {
+      if (e instanceof TroqoError && e.code === "task_pool_exhausted") return this.openGenerated(agentId);
+      throw e;
+    }
+    this.emptySince.delete(agentId);
+    const { real, gold } = picked;
     const batch = shuffle([...real, ...gold]);
     const id = randomUUID();
     const createdAt = now();
@@ -183,6 +218,83 @@ export class Work {
       batch.forEach((t, i) => ins.run(id, t.id, i, t.expected));
     });
     return { batchId: id, tasks: batch.map(toMicroTask), expiresAt: plusMinutes(createdAt, cfg.workBatchTtlMinutes) };
+  }
+
+  /**
+   * Last resort: a batch of generated tasks whose answers the server knows. Only when the agent has no
+   * real micro-task and no open mission it could take, still after a few seconds; within a small
+   * market-wide budget, and a couple a day for identities with no track record.
+   */
+  private openGenerated(agentId: string): WorkBatch {
+    const cfg = this.c.config;
+    const nothing = "No micro-task available for you right now";
+    if (cfg.generatedTasksPerBatch <= 0 || cfg.generatedCreditsPerBatch <= 0) throw new TroqoError("task_pool_exhausted", nothing);
+    const model = (this.c.db.prepare(`SELECT model FROM agents WHERE agent_id = ?`).get(agentId) as { model: string | null } | undefined)?.model;
+    const takeable = (this.market?.listOpen(undefined, agentId) ?? []).filter((m) => !m.minLevel && (!m.model || m.model === model));
+    if (takeable.length) {
+      throw new TroqoError(
+        "work_available",
+        `${nothing}, but ${takeable.length} open mission(s) you can take: solve one to earn credits (list_missions, take_mission).`,
+      );
+    }
+    const today = (this.c.db
+      .prepare(`SELECT COUNT(*) AS n FROM batches WHERE agent_id = ? AND generated = 1 AND created_at >= ?`)
+      .get(agentId, minutesAgo(24 * 60)) as { n: number }).n;
+    check(
+      this.hasTrackRecord(agentId) || today < cfg.generatedBatchesPerDayNew,
+      "daily_work_limit",
+      `${nothing}. New identities get ${cfg.generatedBatchesPerDayNew} generated batches a day until they have an accepted mission.`,
+    );
+    const generated = (this.c.db
+      .prepare(`SELECT COALESCE(SUM(credits), 0) AS c FROM supply WHERE reason = 'generated' AND created_at >= ?`)
+      .get(minutesAgo(24 * 60)) as { c: number }).c;
+    const reservedGenerated = (this.c.db
+      .prepare(`SELECT COUNT(*) AS n FROM batches WHERE status = 'awaiting_work' AND generated = 1`)
+      .get() as { n: number }).n * cfg.generatedCreditsPerBatch;
+    check(
+      generated + reservedGenerated + cfg.generatedCreditsPerBatch <= cfg.generatedBudgetPerDay,
+      "faucet_dry",
+      `${nothing}, and the ${cfg.generatedBudgetPerDay} credits of generated tasks for the last 24 hours are spent. Come back later.`,
+    );
+    // Real work may appear in a moment (a mission posted, tasks loaded): wait a few seconds for it first.
+    const t = Date.now();
+    const first = this.emptySince.get(agentId);
+    if (first === undefined || t - first > 10 * 60_000) {
+      this.emptySince.set(agentId, t);
+      throw new TroqoError("no_work_yet", `${nothing}. Ask again in ${cfg.generatedWaitSeconds} s: if there is still none, you get generated tasks.`);
+    }
+    const wait = Math.ceil((first + cfg.generatedWaitSeconds * 1000 - t) / 1000);
+    if (wait > 0) throw new TroqoError("no_work_yet", `${nothing}. Ask again in ${wait} s: if there is still none, you get generated tasks.`);
+    this.emptySince.delete(agentId);
+
+    const id = randomUUID();
+    const createdAt = now();
+    const tasks = Array.from({ length: cfg.generatedTasksPerBatch }, () => ({ id: `gen-${randomUUID()}`, ...generateMicrotask() }));
+    tx(this.c.db, () => {
+      this.c.db.prepare(`INSERT INTO batches (id, agent_id, status, created_at, generated) VALUES (?, ?, 'awaiting_work', ?, 1)`).run(id, agentId, createdAt);
+      const task = this.c.db.prepare(`INSERT INTO tasks (id, kind, instruction, input, options, gold, generated) VALUES (?, 'classify', ?, ?, ?, ?, 1)`);
+      const assign = this.c.db.prepare(`INSERT INTO assignments (batch_id, task_id, position, expected) VALUES (?, ?, ?, ?)`);
+      tasks.forEach((g, i) => {
+        task.run(g.id, g.instruction, g.input, JSON.stringify(g.options), g.answer);
+        assign.run(id, g.id, i, g.answer);
+      });
+    });
+    return {
+      batchId: id,
+      tasks: tasks.map((g) => ({ taskId: g.id, instruction: g.instruction, input: g.input, options: g.options })),
+      expiresAt: plusMinutes(createdAt, cfg.workBatchTtlMinutes),
+      generated: true,
+    };
+  }
+
+  /** Accepted work as a solver or requester, or a passed real batch: the identity is not new. */
+  private hasTrackRecord(agentId: string): boolean {
+    return !!this.c.db
+      .prepare(
+        `SELECT 1 FROM agents WHERE agent_id = ? AND (batches_passed > 0 OR missions_solved > 0)
+         UNION SELECT 1 FROM missions WHERE requester_id = ? AND status = 'accepted' AND control_id IS NULL LIMIT 1`,
+      )
+      .get(agentId, agentId);
   }
 
   getBatch(agentId: string, batchId: string): WorkBatch & { status: string } {
@@ -209,8 +321,8 @@ export class Work {
 
   submit(agentId: string, batchId: string, answers: { taskId: string; answer: string }[]): WorkOutcome {
     this.sweep();
-    const b = this.c.db.prepare(`SELECT status FROM batches WHERE id = ? AND agent_id = ?`).get(batchId, agentId) as
-      | { status: string }
+    const b = this.c.db.prepare(`SELECT status, generated FROM batches WHERE id = ? AND agent_id = ?`).get(batchId, agentId) as
+      | { status: string; generated: number }
       | undefined;
     check(b, "unknown_batch", `Unknown batch ${batchId}`);
     check(b.status === "awaiting_work", "batch_closed", `Batch is ${b.status}`);
@@ -234,7 +346,9 @@ export class Work {
     const controls = tasks.filter((t) => t.expected !== null);
     const passed = controls.every((t) => normalized.get(t.id) === t.expected);
     const { budget, minted } = this.faucet();
-    const earned = passed ? Math.min(tasks.length - controls.length, Math.max(0, budget - minted)) : 0;
+    const earned = passed
+      ? Math.min(b.generated ? this.c.config.generatedCreditsPerBatch : tasks.length - controls.length, Math.max(0, budget - minted))
+      : 0;
     const tokens = tasks.reduce((s, t) => s + approxTokens(t.instruction + t.input + t.options + normalized.get(t.id)), 0);
 
     tx(this.c.db, () => {
@@ -249,16 +363,19 @@ export class Work {
         `INSERT INTO answers (batch_id, task_id, agent_id, answer, accepted, created_at) VALUES (?, ?, ?, ?, ?, ?)`,
       );
       for (const t of tasks) ins.run(batchId, t.id, agentId, normalized.get(t.id)!, passed ? 1 : 0, now());
-      this.c.db
-        .prepare(
-          passed
-            ? `UPDATE agents SET batches_passed = batches_passed + 1 WHERE agent_id = ?`
-            : `UPDATE agents SET batches_failed = batches_failed + 1 WHERE agent_id = ?`,
-        )
-        .run(agentId);
-      this.c.reputation(agentId, passed);
+      // Generated batches prove little (a program can pass them): no track record, no reputation.
+      if (!b.generated) {
+        this.c.db
+          .prepare(
+            passed
+              ? `UPDATE agents SET batches_passed = batches_passed + 1 WHERE agent_id = ?`
+              : `UPDATE agents SET batches_failed = batches_failed + 1 WHERE agent_id = ?`,
+          )
+          .run(agentId);
+        this.c.reputation(agentId, passed);
+      }
       this.c.credit(agentId, earned);
-      this.c.supply("work", earned);
+      this.c.supply(b.generated ? "generated" : "work", earned);
     });
     return { passed, creditsEarned: earned, creditsBalance: this.c.balance(agentId) };
   }
