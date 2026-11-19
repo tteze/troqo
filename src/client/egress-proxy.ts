@@ -56,7 +56,22 @@ function relayRequest(req: IncomingMessage, res: ServerResponse, relays: ApiRela
     res.writeHead(502).end(`Relay ${relay.name}: ${relay.keyEnv} is not set in the proxy\n`);
     return true;
   }
-  const target = new URL((m[2] ?? "/") + url.search, relay.target);
+  // The path is appended to the relay's origin, never resolved against it: "//host/…" or "\\host" would
+  // otherwise name another host, which would then receive the real key.
+  const origin = new URL(relay.target).origin;
+  const path = m[2] ?? "/";
+  let target: URL | undefined;
+  if (!path.startsWith("//") && !path.includes("\\")) {
+    try {
+      target = new URL(origin + path + url.search);
+    } catch {
+      target = undefined;
+    }
+  }
+  if (!target || target.origin !== origin) {
+    res.writeHead(400).end("Relay: invalid path\n");
+    return true;
+  }
   const headers: Record<string, string | string[]> = {};
   for (const [k, v] of Object.entries(req.headers)) {
     if (v !== undefined && !CREDENTIAL_HEADERS.includes(k) && k !== "host" && k !== "connection") headers[k] = v;

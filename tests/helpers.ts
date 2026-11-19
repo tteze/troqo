@@ -46,13 +46,14 @@ export async function market(config: Partial<ServerConfig> = {}, policy: Certifi
   const troqo = new TroqoServer(
     { dbPath: ":memory:", honeypotRate: 0, powBaseBits: 0, mediatorBondCredits: 0,
     communityMinMediators: 0,
-    moderationSampleRate: 0, mediatorMinRequesters: 0,
+    eligibilityCacheSeconds: 0, // tests change eligibility and check it at once
+    moderationSampleRate: 0, mediatorMinRequesters: 0, mediatorRequesterMinSolvers: 0,
     goldPerBatchNew: 2, // tests/flood.test.ts covers the extra controls of a new identity
     ...config },
     policy,
   );
   troqo.work.loadTasks(bank(40, 10));
-  const server = await startHttp(troqo, { port: 0, adminToken: ADMIN_TOKEN, rateLimitPerMinute: 10_000, registrationsPerHour: 1000 });
+  const server = await startHttp(troqo, { port: 0, adminToken: ADMIN_TOKEN, rateLimitPerMinute: 10_000, registrationsPerHour: 1000, marketCacheMs: 0 });
   const url = `http://127.0.0.1:${(server.address() as { port: number }).port}`;
   return {
     troqo,

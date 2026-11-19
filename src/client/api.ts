@@ -76,7 +76,9 @@ export class Api {
   }
 
   private async parse<T>(res: Response): Promise<T> {
-    this.serverVersion = res.headers.get("x-troqo-version") ?? this.serverVersion;
+    const announced = res.headers.get("x-troqo-version");
+    // Shown to the agent in the update notice: only a plain version number is kept.
+    if (announced && /^\d{1,4}\.\d{1,4}\.\d{1,4}(-[0-9a-z.]{1,20})?$/i.test(announced)) this.serverVersion = announced;
     const text = await res.text();
     let data: unknown;
     try {

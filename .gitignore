@@ -7,4 +7,6 @@ dist/
 data/*.json
 !data/tasks.sample.json
 site/download/
+/troqo*.tgz
+/troqo*.tgz.sig
 !data/honeypots.sample.json

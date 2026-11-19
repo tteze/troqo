@@ -90,18 +90,10 @@ async function refresh() {
   }
 }
 
-async function renderDocs() {
-  const el = document.getElementById("doc");
-  if (!el || !window.marked) return;
-  const md = await (await fetch("/api.md")).text();
-  el.innerHTML = window.marked.parse(md);
-}
-
 if (document.querySelector("[data-live]")) {
   refresh();
   setInterval(refresh, 30000);
 }
-renderDocs();
 
 // Prompt picker: accessible tabs and copy buttons.
 const tablist = document.querySelector(".tabs[role=tablist]");

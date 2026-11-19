@@ -27,6 +27,8 @@ interface TaskRow {
 
 interface BatchRow extends TaskRow {
   expected: string | null;
+  /** The id this task is shown under in this batch. */
+  public_id: string;
 }
 
 const VOTES_SQL = `SELECT task_id, MAX(n) AS top, SUM(n) AS total FROM (
@@ -207,15 +209,15 @@ export class Work {
     }
     this.emptySince.delete(agentId);
     const { real, gold } = picked;
-    const batch = shuffle([...real, ...gold]);
+    const batch = shuffle([...real, ...gold]).map((t) => ({ ...t, public_id: randomUUID() }));
     const id = randomUUID();
     const createdAt = now();
     tx(this.c.db, () => {
       this.c.db
         .prepare(`INSERT INTO batches (id, agent_id, status, created_at) VALUES (?, ?, 'awaiting_work', ?)`)
         .run(id, agentId, createdAt);
-      const ins = this.c.db.prepare(`INSERT INTO assignments (batch_id, task_id, position, expected) VALUES (?, ?, ?, ?)`);
-      batch.forEach((t, i) => ins.run(id, t.id, i, t.expected));
+      const ins = this.c.db.prepare(`INSERT INTO assignments (batch_id, task_id, position, expected, public_id) VALUES (?, ?, ?, ?, ?)`);
+      batch.forEach((t, i) => ins.run(id, t.id, i, t.expected, t.public_id));
     });
     return { batchId: id, tasks: batch.map(toMicroTask), expiresAt: plusMinutes(createdAt, cfg.workBatchTtlMinutes) };
   }
@@ -273,10 +275,10 @@ export class Work {
     tx(this.c.db, () => {
       this.c.db.prepare(`INSERT INTO batches (id, agent_id, status, created_at, generated) VALUES (?, ?, 'awaiting_work', ?, 1)`).run(id, agentId, createdAt);
       const task = this.c.db.prepare(`INSERT INTO tasks (id, kind, instruction, input, options, gold, generated) VALUES (?, 'classify', ?, ?, ?, ?, 1)`);
-      const assign = this.c.db.prepare(`INSERT INTO assignments (batch_id, task_id, position, expected) VALUES (?, ?, ?, ?)`);
+      const assign = this.c.db.prepare(`INSERT INTO assignments (batch_id, task_id, position, expected, public_id) VALUES (?, ?, ?, ?, ?)`);
       tasks.forEach((g, i) => {
         task.run(g.id, g.instruction, g.input, JSON.stringify(g.options), g.answer);
-        assign.run(id, g.id, i, g.answer);
+        assign.run(id, g.id, i, g.answer, g.id);
       });
     });
     return {
@@ -306,8 +308,11 @@ export class Work {
     const tasks =
       b.status === "awaiting_work"
         ? (this.c.db
-            .prepare(`SELECT t.* FROM assignments a JOIN tasks t ON t.id = a.task_id WHERE a.batch_id = ? ORDER BY a.position`)
-            .all(batchId) as unknown as TaskRow[]).map(toMicroTask)
+            .prepare(
+              `SELECT t.*, a.expected, COALESCE(a.public_id, a.task_id) AS public_id FROM assignments a JOIN tasks t ON t.id = a.task_id
+               WHERE a.batch_id = ? ORDER BY a.position`,
+            )
+            .all(batchId) as unknown as BatchRow[]).map(toMicroTask)
         : [];
     return { batchId, status: b.status, tasks, expiresAt: plusMinutes(b.created_at, this.c.config.workBatchTtlMinutes) };
   }
@@ -328,19 +333,23 @@ export class Work {
     check(b.status === "awaiting_work", "batch_closed", `Batch is ${b.status}`);
 
     const tasks = this.c.db
-      .prepare(`SELECT t.*, a.expected FROM assignments a JOIN tasks t ON t.id = a.task_id WHERE a.batch_id = ? ORDER BY a.position`)
+      .prepare(
+        `SELECT t.*, a.expected, COALESCE(a.public_id, a.task_id) AS public_id FROM assignments a JOIN tasks t ON t.id = a.task_id
+         WHERE a.batch_id = ? ORDER BY a.position`,
+      )
       .all(batchId) as unknown as BatchRow[];
+    // Answers are keyed by the ids of this batch; the bank's own ids never leave the server.
     const byTask = new Map(answers.map((a) => [a.taskId, a.answer]));
     const normalized = new Map<string, string>();
     for (const t of tasks) {
-      const raw = byTask.get(t.id);
-      check(raw !== undefined, "missing_answer", `No answer for task ${t.id}`);
+      const raw = byTask.get(t.public_id);
+      check(raw !== undefined, "missing_answer", `No answer for task ${t.public_id}`);
       const options = JSON.parse(t.options) as string[];
       const match = options.find((o) => o.toLowerCase() === raw.trim().toLowerCase());
-      check(match, "invalid_answer", `Answer for ${t.id} must be one of: ${options.join(", ")}`);
+      check(match, "invalid_answer", `Answer for ${t.public_id} must be one of: ${options.join(", ")}`);
       normalized.set(t.id, match);
     }
-    const unknown = answers.find((a) => !tasks.some((t) => t.id === a.taskId));
+    const unknown = answers.find((a) => !tasks.some((t) => t.public_id === a.taskId));
     check(!unknown, "unknown_task", `Task ${unknown?.taskId} is not part of this batch`);
 
     const controls = tasks.filter((t) => t.expected !== null);
@@ -421,6 +430,6 @@ export class Work {
   }
 }
 
-function toMicroTask(t: TaskRow): MicroTask {
-  return { taskId: t.id, instruction: t.instruction, input: t.input, options: JSON.parse(t.options) as string[] };
+function toMicroTask(t: BatchRow): MicroTask {
+  return { taskId: t.public_id, instruction: t.instruction, input: t.input, options: JSON.parse(t.options) as string[] };
 }

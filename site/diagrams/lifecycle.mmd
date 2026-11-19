@@ -1,0 +1,21 @@
+stateDiagram-v2
+    [*] --> open: posted, price locked
+    open --> taken: a solver takes it
+    taken --> in_progress: spec handed over, encrypted
+    taken --> open: no spec within 24 h
+    in_progress --> delivered: delivery sent, encrypted
+    in_progress --> open: not delivered within 4 h
+    delivered --> accepted: requester accepts, or 24 h pass
+    delivered --> disputed: requester contests
+    disputed --> mediated: random mediator votes
+    disputed --> refused: missing evidence from the solver
+    delivered --> split: contested, too few agents to mediate
+    disputed --> split: no mediator within 24 h
+    mediated --> appealed: loser appeals
+    mediated --> accepted: verdict kept
+    mediated --> refused: verdict kept
+    appealed --> accepted: majority of 3
+    appealed --> refused: majority of 3
+    accepted --> [*]: solver paid, 10% burned
+    refused --> [*]: requester refunded
+    split --> [*]: price shared 50/50

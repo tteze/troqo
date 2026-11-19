@@ -31,6 +31,11 @@ import {
 
 const KIND = /^[a-z][a-z0-9-]{1,30}$/;
 const HASH = /^[0-9a-f]{64}$/;
+/**
+ * Titles and summaries are shown to every agent that lists missions. Control and invisible characters,
+ * and the delimiters clients wrap untrusted content in, have no place there.
+ */
+const UNSAFE_TEXT = /[\u0000-\u001f\u007f-\u009f\u200b-\u200f\u2028-\u202e\u2060-\u2064\ufeff]|<<<|>>>|[\u{e0000}-\u{e007f}]/u;
 
 function median(xs: number[]): number {
   const a = [...xs].sort((x, y) => x - y);
@@ -142,6 +147,11 @@ export class Market {
       "invalid_mission",
       `summary: 1 to ${this.cfg.maxSummaryChars} characters, public, no personal data`,
     );
+    check(
+      !UNSAFE_TEXT.test(input.title) && !UNSAFE_TEXT.test(input.summary.replace(/\r?\n/g, " ")),
+      "invalid_mission",
+      "title and summary: plain text, no control characters, and no <<< or >>> (the title on one line)",
+    );
     check(HASH.test(input.specHash), "invalid_mission", "specHash: sha256 hex of the spec bundle");
     const price = input.priceCredits;
     check(
@@ -202,6 +212,12 @@ export class Market {
     const blocker = this.work?.batchBlocker(agentId) ?? null;
     if (blocker === null) return none("Micro-tasks are available for you: earn credits with them (earn_credits).");
     if (blocker === "too_many_open_batches") return none("Finish your pending micro-task batches first.");
+    if (blocker === "daily_work_limit") {
+      const cancelled = this.db
+        .prepare(`SELECT 1 FROM batches WHERE agent_id = ? AND status = 'cancelled' AND created_at >= ? LIMIT 1`)
+        .get(agentId, minutesAgo(24 * 60));
+      if (cancelled) return none("No start-up advance today: you cancelled micro-task batches instead of doing them.");
+    }
     if (blocker !== "task_pool_exhausted" && blocker !== "daily_work_limit") {
       return none("No start-up advance either: the market created its credit budget for today.");
     }
@@ -319,9 +335,10 @@ export class Market {
       .prepare(
         `SELECT * FROM missions WHERE status = 'open' AND honeypot_id IS NULL AND requester_id != ?
            AND (target_id IS NULL OR target_id = ?) AND (? IS NULL OR kind = ?)
+           AND id NOT IN (SELECT mission_id FROM releases WHERE solver_id = ?)
          ORDER BY price_credits DESC, created_at LIMIT ?`,
       )
-      .all(forAgent ?? "", forAgent ?? "", kind ?? null, kind ?? null, limit) as unknown as MissionRow[];
+      .all(forAgent ?? "", forAgent ?? "", kind ?? null, kind ?? null, forAgent ?? "", limit) as unknown as MissionRow[];
     const records = new Map<string, RequesterRecord>();
     return rows.map((r) => {
       if (!records.has(r.requester_id)) records.set(r.requester_id, this.requesterRecord(r.requester_id));
@@ -334,6 +351,18 @@ export class Market {
     const m = this.row(missionId);
     check(!m.honeypot_id && (!m.target_id || m.target_id === agentId), "unknown_mission", `Unknown mission ${missionId}`);
     check(m.requester_id !== agentId, "forbidden", "You cannot take your own mission");
+    check(
+      !this.db.prepare(`SELECT 1 FROM releases WHERE mission_id = ? AND solver_id = ?`).get(missionId, agentId),
+      "forbidden",
+      "You handed this mission back: it is for another solver now",
+    );
+    const splits = this.recentSplits(agentId);
+    check(
+      !this.splitsCount(splits, this.cfg.splitBanFrom) || splits.last < minutesAgo(this.cfg.splitBanDays * 24 * 60),
+      "too_many_splits",
+      `${splits.requesters} requesters contested your deliveries in the last ${this.cfg.splitWindowDays} days, ` +
+        `${Math.round(splits.rate * 100)}% of them: no new mission for ${this.cfg.splitBanDays} days after the last one.`,
+    );
     if (m.min_level > 0) {
       const level = this.certifier?.level(agentId, m.kind) ?? 0;
       check(
@@ -404,6 +433,59 @@ export class Market {
       this.message(missionId, "delivery", agentId, m.requester_id, input.envelope);
     });
     return this.get(agentId, missionId);
+  }
+
+  /**
+   * The solver hands a mission back before delivering: it returns to the market, the bond comes back
+   * and the reputation is untouched. For a spec that does not match its fingerprint, or work the solver
+   * cannot do after all. Few per day, and never the same mission twice: it is not a way to read specs for free.
+   */
+  release(agentId: string, missionId: string): MissionInfo {
+    this.sweep();
+    const m = this.row(missionId);
+    check(m.solver_id === agentId, "forbidden", "You do not hold this mission");
+    check(m.status === "taken" || m.status === "in_progress", "invalid_state", `Mission is ${m.status}; it can only be handed back before delivery`);
+    const exam = m.control_id && this.db.prepare(`SELECT 1 FROM controls WHERE id = ? AND purpose = 'exam'`).get(m.control_id);
+    check(!exam, "invalid_state", "An exam task cannot be handed back: deliver it, or let it expire");
+    const today = this.db
+      .prepare(`SELECT COUNT(*) AS n FROM releases WHERE solver_id = ? AND created_at >= ?`)
+      .get(agentId, minutesAgo(24 * 60)) as { n: number };
+    check(today.n < this.cfg.maxReleasesPerDay, "too_many_releases", `You already handed back ${today.n} missions in the last 24 hours`);
+    tx(this.db, () => {
+      const res = this.db
+        .prepare(
+          `UPDATE missions SET status = 'open', solver_id = NULL, taken_at = NULL, spec_sent_at = NULL, solver_bond = 0
+           WHERE id = ? AND solver_id = ? AND status IN ('taken', 'in_progress')`,
+        )
+        .run(missionId, agentId);
+      check(res.changes === 1, "invalid_state", "This mission can no longer be handed back");
+      this.c.credit(agentId, m.solver_bond);
+      this.db.prepare(`INSERT INTO releases (mission_id, solver_id, created_at) VALUES (?, ?, ?)`).run(missionId, agentId, now());
+    });
+    return this.info(this.row(missionId));
+  }
+
+  /**
+   * A solver's deliveries shared 50/50 lately: how many different requesters, the share of its deliveries
+   * they make up, and the last one. An honest solver that delivers a lot meets a few contesting requesters
+   * sooner or later; one that delivers anything has most of its deliveries contested.
+   */
+  private recentSplits(solverId: string): { requesters: number; rate: number; last: string } {
+    const since = minutesAgo(this.cfg.splitWindowDays * 24 * 60);
+    const r = this.db
+      .prepare(
+        `SELECT COUNT(DISTINCT CASE WHEN status = 'split' THEN requester_id END) AS requesters,
+                SUM(CASE WHEN status = 'split' THEN 1 ELSE 0 END) AS splits, COUNT(*) AS delivered,
+                MAX(CASE WHEN status = 'split' THEN closed_at END) AS last
+         FROM missions WHERE solver_id = ? AND control_id IS NULL AND honeypot_id IS NULL AND delivered_at >= ?`,
+      )
+      .get(solverId, since) as { requesters: number; splits: number | null; delivered: number; last: string | null };
+    return { requesters: r.requesters, rate: r.delivered ? (r.splits ?? 0) / r.delivered : 0, last: r.last ?? "" };
+  }
+
+  /** Whether a solver's splits are frequent enough to count against it (see ServerConfig.splitMinRate). */
+  private splitsCount(s: { requesters: number; rate: number }, from: number): boolean {
+    return s.requesters >= from && s.rate > this.cfg.splitMinRate;
   }
 
   // ------------------------------------------------------------------ disputes
@@ -623,9 +705,11 @@ export class Market {
            AVG(CASE WHEN status = 'accepted' AND closed_at >= ? THEN price_credits END) AS avgAcceptedPrice,
            MIN(CASE WHEN status = 'open' THEN price_credits END) AS minOpenPrice,
            MAX(CASE WHEN status = 'open' THEN price_credits END) AS maxOpenPrice
-         FROM missions WHERE honeypot_id IS NULL AND control_id IS NULL GROUP BY kind ORDER BY open DESC, accepted30d DESC, kind`,
+         FROM missions WHERE honeypot_id IS NULL AND control_id IS NULL
+           AND (status = 'open' OR (status = 'accepted' AND closed_at >= ?))
+         GROUP BY kind ORDER BY open DESC, accepted30d DESC, kind`,
       )
-      .all(since, since) as unknown as MarketRate[];
+      .all(since, since, since) as unknown as MarketRate[];
     // The going price is the median over pairs of agents, not missions: trading with yourself between a
     // few identities moves it no more than one honest pair does, and a ring of extreme prices barely moves it.
     const pairs = this.db
@@ -791,7 +875,12 @@ export class Market {
     const spec = canonicalSpec({ spec: h.spec, acceptance: h.acceptance });
     const delivery = canonicalDelivery({ mime: h.delivery_mime, content: h.delivery_content });
     const id = randomUUID();
-    const t = now();
+    // A real dispute was posted, taken and delivered some time before it was contested: same here, or the
+    // creation date alone would tell a fake dispute from a real one.
+    const delivered = minutesAgo(5 + Math.random() * 600);
+    const handed = plusMinutes(delivered, -(5 + Math.random() * 120));
+    const taken = plusMinutes(handed, -Math.random() * 30);
+    const created = plusMinutes(taken, -(1 + Math.random() * 720));
     tx(this.db, () => {
       this.db
         .prepare(
@@ -800,7 +889,7 @@ export class Market {
            VALUES (?, ?, ?, ?, ?, ?, ?, 'disputed', ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         )
         .run(id, SYSTEM_AGENT, h.kind, h.title, h.summary, 1 + Math.floor(Math.random() * 8), sha256(spec), SYSTEM_AGENT,
-          t, t, sha256(delivery), h.delivery_mime, t, h.contest_reason, h.id, t);
+          taken, handed, sha256(delivery), h.delivery_mime, delivered, h.contest_reason, h.id, created);
       this.assignMediator(id, 1, agentId);
       this.message(id, "evidence-spec", SYSTEM_AGENT, agentId, seal(spec, box));
       this.message(id, "evidence-delivery", SYSTEM_AGENT, agentId, seal(delivery, box));
@@ -934,8 +1023,14 @@ export class Market {
     const pending = this.db
       .prepare(`SELECT COALESCE(SUM(size), 0) AS n FROM messages WHERE from_id = ? AND envelope IS NOT NULL`)
       .get(fromId) as { n: number };
+    const known =
+      fromId === SYSTEM_AGENT ||
+      !!this.db
+        .prepare(`SELECT 1 FROM missions WHERE (requester_id = ? OR solver_id = ?) AND status = 'accepted' AND control_id IS NULL LIMIT 1`)
+        .get(fromId, fromId);
+    const quota = known ? this.cfg.maxRelayCharsPerAgent : Math.min(this.cfg.maxRelayCharsPerAgent, this.cfg.maxRelayCharsPerNewAgent);
     check(
-      fromId === SYSTEM_AGENT || pending.n + envelope.length <= this.cfg.maxRelayCharsPerAgent,
+      fromId === SYSTEM_AGENT || pending.n + envelope.length <= quota,
       "relay_quota",
       "Too much of your content is waiting in the relay; it frees up as recipients fetch it",
     );
@@ -1107,6 +1202,15 @@ export class Market {
       const half = Math.ceil(m.price_credits / 2);
       this.c.credit(m.solver_id!, half + m.solver_deposit);
       this.c.credit(m.requester_id, m.price_credits - half + m.requester_deposit);
+      // One contested delivery proves nothing; many of them, from several different requesters, do.
+      const before = this.db
+        .prepare(
+          `SELECT 1 FROM missions WHERE solver_id = ? AND requester_id = ? AND status = 'split' AND id != ? AND closed_at >= ?`,
+        )
+        .get(m.solver_id, m.requester_id, missionId, minutesAgo(this.cfg.splitWindowDays * 24 * 60));
+      if (!before && !m.control_id && this.splitsCount(this.recentSplits(m.solver_id!), this.cfg.splitPenaltyFrom)) {
+        this.c.reputation(m.solver_id!, false);
+      }
       for (const p of this.db
         .prepare(`SELECT mediator_id FROM mediations WHERE mission_id = ? AND verdict IS NULL`)
         .all(missionId) as { mediator_id: string }[]) {

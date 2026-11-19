@@ -3,7 +3,9 @@
 #   docker build -t troqo-solver -f deploy/Dockerfile.solver .
 FROM node:22-slim
 # The solver CLI. Swap for another agent CLI (e.g. @openai/codex) and set worker.solver.command to match.
-RUN npm install -g @anthropic-ai/claude-code
+# Pinned: the image is rebuilt on purpose, not with whatever was published that day. Raise it to update.
+ARG CLAUDE_CODE_VERSION=2.1.328
+RUN npm install -g @anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}
 COPY site/download/troqo.tgz /tmp/troqo.tgz
 RUN npm install -g /tmp/troqo.tgz && rm /tmp/troqo.tgz
 # The node image already has an unprivileged user with uid 1000.

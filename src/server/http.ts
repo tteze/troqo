@@ -1,8 +1,9 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { VERSION } from "../shared/version.js";
 import { renderMarkdown } from "./markdown.js";
+import { replyDynamic, replyStatic, staticBody, type StaticBody } from "./static.js";
 import { readFile, stat } from "node:fs/promises";
-import { timingSafeEqual } from "node:crypto";
+import { createHash, timingSafeEqual } from "node:crypto";
 import { dirname, extname, join, normalize, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { agentIdFor, HEADERS, requestSigningString, verifyMessage } from "../shared/crypto.js";
@@ -27,6 +28,16 @@ export interface HttpOptions {
   registrationsPerHour?: number;
   /** Long-polls held at once on GET /v1/events, market-wide (3 per agent). */
   maxWatchers?: number;
+  /** Long-polls held at once per client address: many identities behind one address cannot take every place. */
+  maxWatchersPerAddress?: number;
+  /** How long the open-missions list is served from memory, in milliseconds (refreshed after any change). */
+  publicCacheMs?: number;
+  /**
+   * How long the public market figures (GET /v1/market) are served from memory, in milliseconds. They read
+   * the whole history, so they are not recomputed after each change: on a busy market that would be on
+   * every request.
+   */
+  marketCacheMs?: number;
 }
 
 /** Longest a GET /v1/events request is held, in seconds (below the usual proxy timeouts). */
@@ -34,6 +45,9 @@ export const MAX_EVENTS_WAIT = 50;
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..", "..");
 const MAX_BODY = 12_000_000;
+/** Only the routes that carry an envelope need a large body; it is read before the signature can be checked. */
+const SMALL_BODY = 65_536;
+const ENVELOPE_ROUTE = /^\/v1\/missions\/[\w-]+\/(spec|deliver|evidence)$/;
 const CLOCK_SKEW_MS = 5 * 60_000;
 
 const TYPES: Record<string, string> = {
@@ -42,6 +56,8 @@ const TYPES: Record<string, string> = {
   ".js": "text/javascript; charset=utf-8",
   ".json": "application/json",
   ".svg": "image/svg+xml",
+  ".woff2": "font/woff2",
+  ".xml": "application/xml; charset=utf-8",
   ".png": "image/png",
   ".ico": "image/x-icon",
   ".txt": "text/plain; charset=utf-8",
@@ -66,16 +82,28 @@ function statusFor(code: string): number {
   if (code === "faucet_dry" || code === "no_work_yet") return 429;
   if (code === "work_available") return 409;
   if (code === "certification_required") return 403;
-  if (code === "too_many_reports") return 429;
+  if (code === "too_many_reports" || code === "too_many_releases" || code === "too_many_splits") return 429;
   if (code === "already_reported" || code === "already_removed" || code === "appeal_unavailable") return 409;
   if (code === "mission_not_open" || code === "key_conflict" || code === "invalid_state" || code === "batch_closed") return 409;
   return 400;
 }
 
 function send(res: ServerResponse, status: number, body: unknown, headers: Record<string, string> = {}) {
-  res
-    .writeHead(status, { "content-type": "application/json", "cache-control": "no-store", "x-troqo-version": VERSION, ...headers })
-    .end(JSON.stringify(body));
+  replyDynamic(res, status, JSON.stringify(body), { "content-type": "application/json", "cache-control": "no-store", "x-troqo-version": VERSION, ...headers });
+}
+
+/** Site files and rendered pages, kept in memory with their hash and compressed versions until they change. */
+const fileCache = new Map<string, { version: string; body: StaticBody }>();
+
+async function cachedFile(key: string, sources: string[], build: (contents: Buffer[]) => Buffer | string): Promise<StaticBody | null> {
+  const stats = await Promise.all(sources.map((f) => stat(f).catch(() => null)));
+  if (stats.some((st) => !st?.isFile())) return null;
+  const version = stats.map((st) => `${st!.mtimeMs}:${st!.size}`).join("|");
+  const hit = fileCache.get(key);
+  if (hit && hit.version === version) return hit.body;
+  const body = staticBody(build(await Promise.all(sources.map((f) => readFile(f)))));
+  if (fileCache.size < 500) fileCache.set(key, { version, body });
+  return body;
 }
 
 async function readBody(req: IncomingMessage, max = MAX_BODY): Promise<string> {
@@ -91,9 +119,10 @@ async function readBody(req: IncomingMessage, max = MAX_BODY): Promise<string> {
 }
 
 function safeEqual(a: string, b: string) {
-  const x = Buffer.from(a);
-  const y = Buffer.from(b);
-  return x.length === y.length && timingSafeEqual(x, y);
+  // Compared as digests: equal lengths whatever the inputs, so the timing tells nothing about the token.
+  const x = createHash("sha256").update(a).digest();
+  const y = createHash("sha256").update(b).digest();
+  return timingSafeEqual(x, y);
 }
 
 /**
@@ -130,7 +159,20 @@ export class Limiter {
   }
 }
 
-type Handler = (ctx: { agentId: string; body: any; params: string[]; query: URLSearchParams; res: ServerResponse }) => unknown;
+type Handler = (ctx: { agentId: string; body: any; params: string[]; query: URLSearchParams; res: ServerResponse; ip: string }) => unknown;
+
+/** Site pages rendered from Markdown in docs/: path → [template in site/, source in docs/]. */
+const MARKDOWN_PAGES: Record<string, [string, string]> = {
+  "/docs": ["docs.html", "API.md"],
+  "/charter": ["charter.html", "CHARTER.md"],
+  "/contribute": ["contribute.html", "CONTRIBUTING.md"],
+};
+
+/** Sent with every page of the website: everything from the site itself, no inline script. */
+const CSP =
+  "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; " +
+  "font-src 'self'; img-src 'self' data:; " +
+  "connect-src 'self'; object-src 'none'; base-uri 'self'; form-action 'self'; frame-ancestors 'self'";
 
 export function startHttp(troqo: TroqoServer, opts: HttpOptions): Promise<Server> {
   const siteDir = opts.siteDir ?? join(ROOT, "site");
@@ -153,15 +195,34 @@ export function startHttp(troqo: TroqoServer, opts: HttpOptions): Promise<Server
   // agent's state; a periodic wake-up catches deadlines that pass without a request.
   const watchers = new Set<() => void>();
   const watchersPerAgent = new Map<string, number>();
-  const wakeWatchers = () => setImmediate(() => [...watchers].forEach((w) => w()));
+  const watchersPerAddress = new Map<string, number>();
+  // Public reads are the same for everyone and need no signature: computed at most once per interval,
+  // and again after any change made through the API.
+  const publicCache = new Map<string, { until: number; body: unknown }>();
+  const cached = <T>(key: string, compute: () => T, ttl = opts.publicCacheMs ?? 5000): T => {
+    const hit = publicCache.get(key);
+    if (hit && hit.until > Date.now()) return hit.body as T;
+    const body = compute();
+    if (ttl > 0 && publicCache.size < 200) publicCache.set(key, { until: Date.now() + ttl, body });
+    return body;
+  };
+  const wakeWatchers = () => {
+    for (const key of publicCache.keys()) if (key !== "market") publicCache.delete(key);
+    setImmediate(() => [...watchers].forEach((w) => w()));
+  };
   const wakeTimer = setInterval(wakeWatchers, 15_000);
   wakeTimer.unref();
 
-  async function events(agentId: string, since: string, waitSeconds: number, res: ServerResponse) {
+  async function events(agentId: string, since: string, waitSeconds: number, res: ServerResponse, ip: string) {
     let state = market.events(agentId);
     const held = watchersPerAgent.get(agentId) ?? 0;
-    if (!since || state.cursor !== since || !(waitSeconds > 0) || held >= 3 || watchers.size >= (opts.maxWatchers ?? 1000)) return state;
+    const heldHere = watchersPerAddress.get(ip) ?? 0;
+    if (
+      !since || state.cursor !== since || !(waitSeconds > 0) || held >= 3 ||
+      heldHere >= (opts.maxWatchersPerAddress ?? 30) || watchers.size >= (opts.maxWatchers ?? 1000)
+    ) return state;
     watchersPerAgent.set(agentId, held + 1);
+    watchersPerAddress.set(ip, heldHere + 1);
     const deadline = Date.now() + Math.min(waitSeconds, MAX_EVENTS_WAIT) * 1000;
     let gone = false;
     const onGone = () => (gone = true);
@@ -189,14 +250,17 @@ export function startHttp(troqo: TroqoServer, opts: HttpOptions): Promise<Server
       const n = (watchersPerAgent.get(agentId) ?? 1) - 1;
       if (n > 0) watchersPerAgent.set(agentId, n);
       else watchersPerAgent.delete(agentId);
+      const here = (watchersPerAddress.get(ip) ?? 1) - 1;
+      if (here > 0) watchersPerAddress.set(ip, here);
+      else watchersPerAddress.delete(ip);
     }
   }
 
   // Signed routes: [method, pattern, handler]. Captured groups become params.
   const routes: [string, RegExp, Handler][] = [
     ["GET", /^\/v1\/account$/, ({ agentId }) => troqo.account(agentId)],
-    ["GET", /^\/v1\/events$/, ({ agentId, query, res }) =>
-      events(agentId, query.get("since") ?? "", Number(query.get("wait") ?? 0), res)],
+    ["GET", /^\/v1\/events$/, ({ agentId, query, res, ip }) =>
+      events(agentId, query.get("since") ?? "", Number(query.get("wait") ?? 0), res, ip)],
     ["POST", /^\/v1\/work$/, ({ agentId }) => work.openBatch(agentId)],
     ["GET", /^\/v1\/work\/([\w-]+)$/, ({ agentId, params }) => work.getBatch(agentId, params[0])],
     ["POST", /^\/v1\/work\/([\w-]+)\/submit$/, ({ agentId, params, body }) => work.submit(agentId, params[0], arr(body.answers))],
@@ -227,6 +291,7 @@ export function startHttp(troqo: TroqoServer, opts: HttpOptions): Promise<Server
     ["POST", /^\/v1\/missions\/([\w-]+)\/respond$/, ({ agentId, params, body }) =>
       market.respond(agentId, params[0], oneOf(body.decision, ["accept", "appeal"]))],
     ["POST", /^\/v1\/missions\/([\w-]+)\/cancel$/, ({ agentId, params }) => market.cancel(agentId, params[0])],
+    ["POST", /^\/v1\/missions\/([\w-]+)\/release$/, ({ agentId, params }) => market.release(agentId, params[0])],
     ["POST", /^\/v1\/missions\/([\w-]+)\/evidence$/, ({ agentId, params, body }) =>
       market.sendEvidence(agentId, params[0], str(body.to), str(body.envelope))],
     ["POST", /^\/v1\/missions\/([\w-]+)\/mediate$/, ({ agentId, params, body }) =>
@@ -276,7 +341,7 @@ export function startHttp(troqo: TroqoServer, opts: HttpOptions): Promise<Server
 
     let signPublic: string;
     if (path === "/v1/register") {
-      signPublic = String(JSON.parse(body || "{}").signPublic ?? "");
+      signPublic = String(JSON.parse(body || "{}")?.signPublic ?? "");
       if (agentIdFor(signPublic) !== agentId) throw new HttpError(401, "unauthorized", "Agent id does not match the key");
     } else {
       signPublic = troqo.publicKeys(agentId).signPublic;
@@ -295,16 +360,16 @@ export function startHttp(troqo: TroqoServer, opts: HttpOptions): Promise<Server
     if (!opts.adminToken || !token || !safeEqual(token, opts.adminToken)) throw new HttpError(401, "unauthorized", "Admin token required");
   }
 
-  async function serveFile(res: ServerResponse, file: string, cache = "public, max-age=300") {
-    try {
-      const s = await stat(file);
-      if (!s.isFile()) return false;
-      const type = TYPES[extname(file)] ?? "application/octet-stream";
-      res.writeHead(200, { "content-type": type, "cache-control": cache }).end(await readFile(file));
-      return true;
-    } catch {
-      return false;
-    }
+  async function serveFile(res: ServerResponse, file: string) {
+    const body = await cachedFile(file, [file], ([b]) => b);
+    if (!body) return false;
+    const type = TYPES[extname(file)] ?? "application/octet-stream";
+    // Fonts and diagrams rarely change: a week. Everything else is checked again after 5 minutes (a 304 then).
+    const long = file.includes(`${sep}fonts${sep}`) || file.includes(`${sep}diagrams${sep}`);
+    const headers: Record<string, string> = { "content-type": type, "cache-control": long ? "public, max-age=604800" : "public, max-age=300" };
+    if (type.startsWith("text/html")) headers["content-security-policy"] = CSP;
+    replyStatic(res, body, headers);
+    return true;
   }
 
   const server = createServer(async (req, res) => {
@@ -330,8 +395,13 @@ export function startHttp(troqo: TroqoServer, opts: HttpOptions): Promise<Server
         if (path === "/health") return send(res, 200, { ok: true });
         if (path === "/v1/pow") return send(res, 200, powFor(ip));
         if (path === "/v1/certification/policy") return send(res, 200, troqo.certifier.policy, { "cache-control": "public, max-age=300" });
-        if (path === "/v1/market") return send(res, 200, troqo.publicMarket(), { "cache-control": "public, max-age=15" });
-        if (path === "/v1/missions/open") return send(res, 200, market.listOpen(url.searchParams.get("kind") ?? undefined));
+        if (path === "/v1/market") return send(res, 200, cached("market", () => troqo.publicMarket(), opts.marketCacheMs ?? 15_000), { "cache-control": "public, max-age=15" });
+        if (path === "/v1/missions/open") {
+          const kind = url.searchParams.get("kind") ?? undefined;
+          // Only well-formed kinds get a cache entry: the key space stays small.
+          const list = () => market.listOpen(kind);
+          return send(res, 200, kind === undefined || /^[a-z][a-z0-9-]{1,30}$/.test(kind) ? cached(`open:${kind ?? ""}`, list) : list());
+        }
         const keys = path.match(/^\/v1\/agents\/([\w-]+)$/);
         if (keys) return send(res, 200, troqo.publicProfile(keys[1]));
         if (path === "/api.md" || path === "/llms.txt") {
@@ -369,18 +439,21 @@ export function startHttp(troqo: TroqoServer, opts: HttpOptions): Promise<Server
         const agentId = authenticate(req, pathWithQuery, body);
         if (troqo.ctx.agentExists(agentId)) return send(res, 200, { agentId, created: false });
         if (!registrations.allow(ip)) throw new HttpError(429, "rate_limited", "Too many new identities from this address");
-        const b = JSON.parse(body);
+        const b = JSON.parse(body) ?? {};
         const str = (v: unknown) => (v === undefined ? "" : String(v));
         const out = troqo.register(str(b.signPublic), str(b.boxPublic), str(b.boxSignature), str(b.pow), powFor(ip));
         if (out.agentId !== agentId) throw new HttpError(401, "unauthorized", "Agent id does not match the key");
-        if (out.created) networkRegistrations.allow(networkKey(ip));
+        if (out.created) {
+          networkRegistrations.allow(networkKey(ip));
+          publicCache.clear();
+        }
         return send(res, out.created ? 201 : 200, out);
       }
       if (path.startsWith("/v1/")) {
         const route = routes.find(([m, re]) => m === req.method && re.test(path));
         if (!route) throw new HttpError(404, "not_found", "No such endpoint (see /api.md)");
         preAuthenticate(req, path);
-        const body = req.method === "POST" ? await readBody(req) : "";
+        const body = req.method === "POST" ? await readBody(req, ENVELOPE_ROUTE.test(path) ? MAX_BODY : SMALL_BODY) : "";
         const agentId = authenticate(req, pathWithQuery, body);
         let parsed: unknown = {};
         try {
@@ -389,7 +462,7 @@ export function startHttp(troqo: TroqoServer, opts: HttpOptions): Promise<Server
           throw new HttpError(400, "invalid_json", "Body must be JSON");
         }
         const params = path.match(route[1])!.slice(1);
-        const out = await route[2]({ agentId, body: parsed ?? {}, params, query: url.searchParams, res });
+        const out = await route[2]({ agentId, body: parsed ?? {}, params, query: url.searchParams, res, ip });
         if (req.method === "POST") wakeWatchers();
         if (res.writableEnded || res.destroyed) return; // a long-poll whose client left
         return send(res, 200, out);
@@ -403,15 +476,16 @@ export function startHttp(troqo: TroqoServer, opts: HttpOptions): Promise<Server
         } catch {
           throw new HttpError(400, "bad_path", "Malformed URL");
         }
-        // The charter page is rendered from docs/CHARTER.md, so the site and the repository never differ.
-        if (rel === "/charter" || rel === "/charter.html") {
-          try {
-            const [template, md] = await Promise.all([readFile(join(siteDir, "charter.html"), "utf8"), readFile(join(dirname(docsFile), "CHARTER.md"), "utf8")]);
-            const html = template.replace("<!-- CHARTER -->", renderMarkdown(md));
-            res.writeHead(200, { "content-type": "text/html; charset=utf-8", "cache-control": "public, max-age=300" }).end(req.method === "HEAD" ? undefined : html);
+        // Pages written in Markdown in docs/ (the charter, how to contribute) are rendered into their
+        // template, so the site and the repository never differ.
+        const mdPage = MARKDOWN_PAGES[rel.replace(/\.html$/, "")];
+        if (mdPage) {
+          const page = await cachedFile(`page:${mdPage[0]}`, [join(siteDir, mdPage[0]), join(dirname(docsFile), mdPage[1])], ([template, md]) =>
+            template.toString("utf8").replace("<!-- MARKDOWN -->", () => renderMarkdown(md.toString("utf8"))),
+          );
+          if (page) {
+            replyStatic(res, page, { "content-type": "text/html; charset=utf-8", "cache-control": "public, max-age=300", "content-security-policy": CSP });
             return;
-          } catch {
-            // fall through to a 404
           }
         }
         if (rel.endsWith("/")) rel += "index.html";

@@ -1,0 +1,19 @@
+flowchart TB
+    subgraph T["Troqo server: market and matching only"]
+        direction LR
+        MK["Missions: kind, title,<br/>summary, price"]
+        LG["Credits, escrow,<br/>reputation"]
+        FP["Fingerprints of specs<br/>and deliveries"]
+        DR["Mediator draws,<br/>market rates"]
+    end
+    A["Agent A + Troqo client"]
+    B["Agent B + Troqo client"]
+    C["Mediator + Troqo client"]
+    R(["Relay: ciphertext only, erased once fetched"])
+    A -. "signed metadata" .-> T
+    B -. "signed metadata" .-> T
+    C -. "signed metadata" .-> T
+    A == "spec, encrypted for B" ==> R
+    R == "fetched by B" ==> B
+    B == "delivery, encrypted for A" ==> R
+    B == "dispute only: delivery, encrypted for C" ==> C

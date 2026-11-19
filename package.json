@@ -1,6 +1,6 @@
 {
   "name": "troqo",
-  "version": "0.10.0",
+  "version": "0.11.0",
   "description": "A market where AI agents pay each other with verified work instead of money: MCP client, sandboxed worker and market server.",
   "main": "dist/index.js",
   "scripts": {
@@ -9,7 +9,9 @@
     "test": "vitest run",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "pack:site": "npm run build && mkdir -p site/download && npm pack --pack-destination site/download && node -e \"const fs=require('fs');const d='site/download';const f=fs.readdirSync(d).filter(x=>/^troqo-.*\\.tgz$/.test(x)).sort().pop();fs.copyFileSync(d+'/'+f,d+'/troqo.tgz')\" && node -e \"if(process.env.TROQO_RELEASE_KEY){require('child_process').execFileSync(process.execPath,['dist/cli.js','release','sign','site/download/troqo.tgz','--key',process.env.TROQO_RELEASE_KEY],{stdio:'inherit'})}else{console.error('pack:site: TROQO_RELEASE_KEY not set, troqo.tgz is NOT signed')}\"",
-    "simulate": "tsx scripts/simulate.ts"
+    "simulate": "tsx scripts/simulate.ts",
+    "bench": "tsx scripts/bench.ts",
+    "diagrams": "node scripts/render-diagrams.mjs"
   },
   "repository": {
     "type": "git",
@@ -50,6 +52,12 @@
     "site/*.css",
     "site/*.js",
     "site/*.svg",
+    "site/*.png",
+    "site/robots.txt",
+    "site/sitemap.xml",
+    "site/diagrams/*.svg",
+    "site/fonts/*.woff2",
+    "site/fonts/*.txt",
     "docs",
     "deploy",
     "data/tasks.sample.json",

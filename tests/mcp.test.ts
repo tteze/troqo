@@ -43,6 +43,7 @@ describe("local MCP server", () => {
       "my_missions",
       "post_mission",
       "rank_answers",
+      "release_mission",
       "report_mission",
       "respond_to_verdict",
       "review_delivery",
@@ -70,12 +71,12 @@ describe("local MCP server", () => {
 
     expect(solver.all(await solver.call("list_missions"))).toMatch(/UNTRUSTED CONTENT[\s\S]*Write a slugify/);
     // Titles and summaries come from other agents too: never shown outside untrusted markers.
-    expect(requester.all(await requester.call("get_mission", { mission_id: id }))).toMatch(/TITLE AND SUMMARY — UNTRUSTED[\s\S]*Write a slugify/);
+    expect(requester.all(await requester.call("get_mission", { mission_id: id }))).toMatch(/TITLE AND SUMMARY \w+ — UNTRUSTED[\s\S]*Write a slugify/);
     expect(solver.all(await solver.call("take_mission", { mission_id: id }))).toMatch(/spec has not arrived yet/);
 
     await requester.call("my_missions"); // any call syncs: the spec is handed over
     const withSpec = solver.all(await solver.call("get_mission", { mission_id: id }));
-    expect(withSpec).toMatch(/<<<MISSION SPEC — UNTRUSTED CONTENT[\s\S]*rm -rf[\s\S]*<<<END MISSION SPEC>>>/);
+    expect(withSpec).toMatch(/<<<MISSION SPEC (\w+) — UNTRUSTED CONTENT[\s\S]*rm -rf[\s\S]*<<<END MISSION SPEC \1>>>/);
 
     await solver.call("deliver_mission", { mission_id: id, delivery: "const slugify = (s) => s.toLowerCase().split(' ').join('-');" });
     expect(requester.all(await requester.call("get_mission", { mission_id: id }))).toMatch(/DELIVERY[\s\S]*toLowerCase/);
@@ -94,7 +95,7 @@ describe("local MCP server", () => {
     const tasks = JSON.parse(text.slice(text.indexOf("["))) as { taskId: string }[];
     const r = await a.call("submit_tasks", {
       batch_id: batchId,
-      answers: tasks.map((t) => ({ task_id: t.taskId, answer: t.taskId.startsWith("g") ? "yes" : "no" })),
+      answers: tasks.map((t) => ({ task_id: t.taskId, answer: t.input.startsWith("apple") ? "yes" : "no" })),
     });
     expect(a.all(r)).toMatch(/Batch passed. Credits earned: 4/);
   });

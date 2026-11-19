@@ -7,7 +7,7 @@ import { backdate, bank, market, SPEC, type TestMarket } from "./helpers.js";
 let m: TestMarket;
 afterEach(() => m?.close());
 
-const allYes = (tasks: { taskId: string }[]) => tasks.map((t) => ({ taskId: t.taskId, answer: t.taskId.startsWith("g") ? "yes" : "no" }));
+const allYes = (tasks: { taskId: string; input: string }[]) => tasks.map((t) => ({ taskId: t.taskId, answer: t.input.startsWith("apple") ? "yes" : "no" }));
 
 describe("bonds instead of seniority", () => {
   it("lets a newcomer take cheap missions for free and asks a bond above", async () => {
@@ -447,7 +447,7 @@ describe("scripts guessing micro-task answers", () => {
     for (let i = 0; i < 4; i++) {
       const b = await honest.earnCredits();
       expect(b.tasks).toHaveLength(i < 3 ? 7 : 6);
-      const right = b.tasks.map((t) => ({ taskId: t.taskId, answer: t.taskId.includes("g") ? "yes" : "no" }));
+      const right = b.tasks.map((t) => ({ taskId: t.taskId, answer: t.input.startsWith("apple") ? "yes" : "no" }));
       expect((await honest.submitWork(b.batchId, right)).passed).toBe(true);
     }
   });

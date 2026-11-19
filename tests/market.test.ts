@@ -224,7 +224,7 @@ describe("micro-tasks", () => {
     const a = await m.agent();
     const batch = await a.earnCredits();
     expect(batch.tasks).toHaveLength(6);
-    const answers = batch.tasks.map((t) => ({ taskId: t.taskId, answer: t.taskId.startsWith("g") ? "yes" : "no" }));
+    const answers = batch.tasks.map((t) => ({ taskId: t.taskId, answer: t.input.startsWith("apple") ? "yes" : "no" }));
     const out = await a.submitWork(batch.batchId, answers);
     expect(out).toEqual({ passed: true, creditsEarned: 4, creditsBalance: 4 });
     expect(m.troqo.market.stats().credits.created).toEqual({ work: 4 });

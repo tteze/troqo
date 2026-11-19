@@ -228,10 +228,13 @@ CREATE TABLE IF NOT EXISTS supply (
 CREATE INDEX IF NOT EXISTS idx_agents_created ON agents(created_at);
 CREATE INDEX IF NOT EXISTS idx_controls_agent ON controls(agent_id, kind, purpose);
 CREATE INDEX IF NOT EXISTS idx_controls_mission ON controls(mission_id);
-CREATE INDEX IF NOT EXISTS idx_supply_time ON supply(reason, created_at);
+DROP INDEX IF EXISTS idx_supply_time;
+CREATE INDEX IF NOT EXISTS idx_supply_reason ON supply(reason, created_at, credits);
 CREATE INDEX IF NOT EXISTS idx_answers_task ON answers(task_id);
 CREATE INDEX IF NOT EXISTS idx_batches_agent ON batches(agent_id, status);
 CREATE INDEX IF NOT EXISTS idx_missions_status ON missions(status, kind);
+CREATE INDEX IF NOT EXISTS idx_missions_solver ON missions(solver_id, status);
+CREATE INDEX IF NOT EXISTS idx_missions_requester ON missions(requester_id, status, solver_id);
 CREATE INDEX IF NOT EXISTS idx_mediations_mediator ON mediations(mediator_id, verdict);
 CREATE INDEX IF NOT EXISTS idx_messages_to ON messages(to_id, fetched_at);
 CREATE INDEX IF NOT EXISTS idx_messages_mission ON messages(mission_id, kind, from_id, to_id);
@@ -269,6 +272,24 @@ export function openDb(path: string): Db {
   // Generated micro-tasks (a last resort, see src/server/microtasks.ts) and the batches made of them.
   add("tasks", { generated: "INTEGER NOT NULL DEFAULT 0" });
   add("batches", { generated: "INTEGER NOT NULL DEFAULT 0" });
+  // The id a task is shown under in one batch: different in every batch, so identities cannot compare
+  // batches to find which tasks come back (the controls).
+  add("assignments", { public_id: "TEXT" });
+  // Missions a solver handed back before delivering (see Market.release).
+  db.exec(`CREATE TABLE IF NOT EXISTS releases (
+    mission_id TEXT NOT NULL,
+    solver_id TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    PRIMARY KEY (mission_id, solver_id)
+  )`);
+  // Covering indexes for the market's aggregates (rates, history, mediator eligibility), which read every
+  // public mission: the table itself is not touched. Partial, so control and fake missions stay out of them.
+  // After the migrations: they use columns added by them.
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_missions_public ON missions(status, closed_at, kind, price_credits, requester_id, solver_id, solver_model)
+  WHERE honeypot_id IS NULL AND control_id IS NULL;
+CREATE INDEX IF NOT EXISTS idx_missions_paid_by ON missions(status, requester_id, solver_id) WHERE honeypot_id IS NULL AND control_id IS NULL;
+CREATE INDEX IF NOT EXISTS idx_missions_paid ON missions(status, solver_id, requester_id) WHERE honeypot_id IS NULL AND control_id IS NULL;
+CREATE INDEX IF NOT EXISTS idx_missions_controls ON missions(status, requester_id) WHERE control_id IS NOT NULL;`);
   return db;
 }
 

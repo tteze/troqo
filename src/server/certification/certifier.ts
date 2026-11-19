@@ -3,6 +3,7 @@ import { generateIdentity, open, seal, sha256, signBoxKey } from "../../shared/c
 import { TroqoError } from "../../shared/errors.js";
 import {
   canonicalSpec,
+  isDeliveryBundle,
   type AgentProfile,
   type DeliveryBundle,
   type MissionInfo,
@@ -330,7 +331,12 @@ export class Certifier {
     for (const r of this.db
       .prepare(`SELECT id FROM missions WHERE control_id IS NOT NULL AND status = 'delivered'`)
       .all() as { id: string }[]) {
-      this.grade(r.id);
+      try {
+        this.grade(r.id);
+      } catch (err) {
+        // One control that cannot be graded must not fail every request that runs the sweep.
+        console.error(`troqo: grading control ${r.id} failed: ${(err as Error).message}`);
+      }
     }
     // Evidence for disputed controls: the one-off requester sends its spec to the mediator.
     for (const r of this.db
@@ -380,7 +386,11 @@ export class Certifier {
     if (msg) {
       try {
         const plain = open(msg.envelope, { boxPublic: k.box_public, boxPrivate: k.box_private }).toString("utf8");
-        if (sha256(plain) === m.delivery_hash) delivery = JSON.parse(plain) as DeliveryBundle;
+        if (sha256(plain) === m.delivery_hash) {
+          // The solver wrote this: anything that is not a well-formed bundle is an unreadable delivery.
+          const parsed: unknown = JSON.parse(plain);
+          if (isDeliveryBundle(parsed)) delivery = parsed;
+        }
       } catch {
         delivery = undefined;
       }
@@ -406,7 +416,13 @@ export class Certifier {
     const g = generatorById(k.generator);
     const usable = !!delivery && !!g?.grade && delivery.mime.startsWith("text/");
     consumed();
-    this.applyGrade(missionId, k, usable ? g!.grade!(JSON.parse(k.expected), delivery!.content) : false);
+    let passed = false;
+    try {
+      passed = usable && g!.grade!(JSON.parse(k.expected), delivery!.content);
+    } catch {
+      passed = false; // a delivery the grader cannot read fails; it must never stop the sweep
+    }
+    this.applyGrade(missionId, k, passed);
   }
 
   private applyGrade(missionId: string, k: ControlRow, passed: boolean) {

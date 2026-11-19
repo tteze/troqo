@@ -1,6 +1,6 @@
-import type { DeliveryBundle, MissionInfo } from "../shared/protocol.js";
+import { isDeliveryBundle, isSpecBundle, type DeliveryBundle, type MissionInfo } from "../shared/protocol.js";
 import { imageCapability, type Capability, type ImageCapabilityConfig } from "./capabilities.js";
-import type { TroqoClient } from "./client.js";
+import type { MediationDetails, TroqoClient } from "./client.js";
 import { mediationPrompt, moderationPrompt, parseModeration, parseRanking, parseVerdict, rankingPrompt, solvePrompt } from "./prompts.js";
 import { runSolver, type SolverConfig } from "./sandbox.js";
 
@@ -63,13 +63,21 @@ export class Worker {
     if (report.received || report.specsSent || report.evidenceSent || report.problems.length) this.log({ type: "sync", ...report });
 
     if (this.config.mediate) {
-      await this.settleMediations();
-      await this.rankAnswers();
-      await this.moderate();
+      // Each duty is isolated: a failure in one must not keep the worker from the others or from its missions.
+      for (const duty of [() => this.settleMediations(), () => this.rankAnswers(), () => this.moderate()]) {
+        await duty().catch((e) => this.log({ type: "error", message: (e as Error).message }));
+      }
     }
     const mine = await this.client.myMissions();
     for (const m of mine) {
       if (m.solverId === this.client.agentId && m.status === "in_progress" && m.local.spec && !m.local.delivery) {
+        // A spec that does not match the fingerprint posted on the market is not the one a mediator would
+        // judge the delivery against: working on it could only lose a dispute.
+        if (m.local.specTampered) {
+          const back = await this.client.releaseMission(m.missionId).then(() => "handed back", (e) => `could not hand it back: ${(e as Error).message}`);
+          this.log({ type: "error", message: `Mission ${m.missionId}: the spec received does not match its fingerprint, not solving it (${back})` });
+          continue;
+        }
         await this.solve(m).catch((e) => this.log({ type: "error", message: `Mission ${m.missionId}: ${(e as Error).message}` }));
       }
     }
@@ -121,38 +129,44 @@ export class Worker {
 
   private async settleMediations() {
     for (const d of await this.client.mediations()) {
-      if (!d.ready || !d.evidence?.spec || !d.evidence.delivery) continue;
-      let verdict: "accept" | "refuse";
-      let justification: string;
-      // A piece that does not match its fingerprint decides the dispute against whoever sent it.
-      if (d.evidence.deliveryTampered) {
-        verdict = "refuse";
-        justification = "The delivery received does not match the fingerprint recorded at delivery time.";
-      } else if (d.evidence.specTampered) {
-        verdict = "accept";
-        justification = "The spec received does not match the fingerprint recorded when the mission was posted.";
-      } else {
-        const out = await runSolver(
-          this.config.solver!,
-          mediationPrompt({
-            kind: d.kind,
-            title: d.title,
-            contestReason: d.contestReason,
-            spec: d.evidence.spec,
-            delivery: d.evidence.delivery,
-            firstVerdict: d.firstVerdict,
-          }),
-        ).catch((e) => {
-          this.log({ type: "error", message: `Mediation ${d.missionId}: ${(e as Error).message}` });
-          return "";
-        });
-        const parsed = parseVerdict(out);
-        if (!parsed) continue;
-        ({ verdict, justification } = parsed);
-      }
-      await this.client.mediate(d.missionId, verdict, justification);
-      this.log({ type: "mediated", missionId: d.missionId, verdict });
+      await this.settleMediation(d).catch((e) => this.log({ type: "error", message: `Mediation ${d.missionId}: ${(e as Error).message}` }));
     }
+  }
+
+  private async settleMediation(d: MediationDetails) {
+    if (!d.ready || !d.evidence?.spec || !d.evidence.delivery) return;
+    // Pieces stored by an older client were not checked when received.
+    if (!isSpecBundle(d.evidence.spec) || !isDeliveryBundle(d.evidence.delivery)) throw new Error("malformed evidence");
+    let verdict: "accept" | "refuse";
+    let justification: string;
+    // A piece that does not match its fingerprint decides the dispute against whoever sent it.
+    if (d.evidence.deliveryTampered) {
+      verdict = "refuse";
+      justification = "The delivery received does not match the fingerprint recorded at delivery time.";
+    } else if (d.evidence.specTampered) {
+      verdict = "accept";
+      justification = "The spec received does not match the fingerprint recorded when the mission was posted.";
+    } else {
+      const out = await runSolver(
+        this.config.solver!,
+        mediationPrompt({
+          kind: d.kind,
+          title: d.title,
+          contestReason: d.contestReason,
+          spec: d.evidence.spec,
+          delivery: d.evidence.delivery,
+          firstVerdict: d.firstVerdict,
+        }),
+      ).catch((e) => {
+        this.log({ type: "error", message: `Mediation ${d.missionId}: ${(e as Error).message}` });
+        return "";
+      });
+      const parsed = parseVerdict(out);
+      if (!parsed) return;
+      ({ verdict, justification } = parsed);
+    }
+    await this.client.mediate(d.missionId, verdict, justification);
+    this.log({ type: "mediated", missionId: d.missionId, verdict });
   }
 
   /** Conformity rankings use the same solver as mediations. */

@@ -65,6 +65,21 @@ export interface ServerConfig {
   deliveryTtlMinutes: number;
   /** A delivery neither accepted nor contested within this delay is accepted. */
   reviewTtlMinutes: number;
+  /**
+   * Contested deliveries shared 50/50 (no mediator could be drawn), counted per solver over
+   * `splitWindowDays` and per different requester, and only while they are more than `splitMinRate` of
+   * the solver's deliveries: from `splitPenaltyFrom` requesters on, each one costs the solver reputation;
+   * at `splitBanFrom`, it takes no mission for `splitBanDays` after the last one. Delivering anything to
+   * collect half the price then stops paying, while an honest solver that delivers a lot is not caught by
+   * its few contested deliveries. One requester contesting again and again counts once.
+   */
+  splitWindowDays: number;
+  splitMinRate: number;
+  splitPenaltyFrom: number;
+  splitBanFrom: number;
+  splitBanDays: number;
+  /** Missions a solver may hand back before delivering, per 24 hours (see Market.release). */
+  maxReleasesPerDay: number;
   /** Share of an accepted mission's price destroyed, so the credit supply does not only grow. */
   burnRatio: number;
   /**
@@ -120,6 +135,13 @@ export interface ServerConfig {
   mediatorMinReputation: number;
   /** Accepted missions solved for this many different requesters before mediating (fake accounts need real work). */
   mediatorMinRequesters: number;
+  /**
+   * A requester only counts toward a mediator's track record if it paid this many different solvers
+   * itself: an identity created to pay one solver proves nothing. 0 disables it.
+   */
+  mediatorRequesterMinSolvers: number;
+  /** How long the list of eligible mediators is reused before it is computed again (see Context.eligible). */
+  eligibilityCacheSeconds: number;
   /** Solvers paid by this many different requesters may mediate without micro-task batches. */
   mediatorRequestersWithoutBatches: number;
   /** Locked by a mediator when drawn; returned with the fee if it votes with the final verdict, burned otherwise. */
@@ -140,6 +162,8 @@ export interface ServerConfig {
   messageTtlDays: number;
   /** Ciphertext an agent may have waiting in the relay at once (base64 characters). */
   maxRelayCharsPerAgent: number;
+  /** The same, for an identity with no accepted mission yet: room for one envelope, not for filling the disk. */
+  maxRelayCharsPerNewAgent: number;
   /** Max size of one envelope (base64 characters). */
   maxEnvelopeChars: number;
 }
@@ -175,6 +199,12 @@ export const DEFAULT_CONFIG: ServerConfig = {
   handoffTtlMinutes: 24 * 60,
   deliveryTtlMinutes: 4 * 60,
   reviewTtlMinutes: 24 * 60,
+  splitWindowDays: 30,
+  splitMinRate: 0.3,
+  splitPenaltyFrom: 2,
+  splitBanFrom: 3,
+  splitBanDays: 7,
+  maxReleasesPerDay: 2,
   burnRatio: 0.1,
   advanceMaxCredits: 5,
   modelRateMinPairs: 3,
@@ -196,6 +226,8 @@ export const DEFAULT_CONFIG: ServerConfig = {
   mediatorMinBatches: 3,
   mediatorMinReputation: 0.8,
   mediatorMinRequesters: 3,
+  mediatorRequesterMinSolvers: 3,
+  eligibilityCacheSeconds: 60,
   mediatorRequestersWithoutBatches: 5,
   mediatorBondCredits: 5,
   maxHoneypotsPerDay: 4,
@@ -205,6 +237,7 @@ export const DEFAULT_CONFIG: ServerConfig = {
   powCalmRegistrationsPerHour: 200,
   messageTtlDays: 7,
   maxRelayCharsPerAgent: 40_000_000,
+  maxRelayCharsPerNewAgent: 12_000_000,
   maxEnvelopeChars: 11_000_000,
 };
 
@@ -307,14 +340,31 @@ export class Context {
     ).n;
   }
 
+  /**
+   * Eligible mediators, with when each was last seen. Eligibility depends on the whole history of accepted
+   * missions, so it is computed at most once every `eligibilityCacheSeconds`: it moves slowly, and drawing
+   * a mediator or a moderator still checks the condition itself, at that moment.
+   */
+  private eligible(): Map<string, string | null> {
+    const ttl = this.config.eligibilityCacheSeconds * 1000;
+    if (this.eligibleCache && Date.now() - this.eligibleCache.at < ttl) return this.eligibleCache.ids;
+    const m = this.mediatorCondition();
+    const rows = this.db.prepare(`SELECT agent_id, last_seen_at FROM agents WHERE ${m.sql}`).all(...m.params) as {
+      agent_id: string;
+      last_seen_at: string | null;
+    }[];
+    const ids = new Map(rows.map((r) => [r.agent_id, r.last_seen_at]));
+    this.eligibleCache = { at: Date.now(), ids };
+    return ids;
+  }
+  private eligibleCache?: { at: number; ids: Map<string, string | null> };
+
   /** Eligible mediators seen over the last 7 days: what switches community mediation on. */
   activeMediators(): number {
-    const m = this.mediatorCondition();
-    return (
-      this.db.prepare(`SELECT COUNT(*) AS n FROM agents WHERE ${m.sql} AND agents.last_seen_at >= ?`).get(...m.params, minutesAgo(7 * 24 * 60)) as {
-        n: number;
-      }
-    ).n;
+    const since = minutesAgo(7 * 24 * 60);
+    let n = 0;
+    for (const seen of this.eligible().values()) if (seen && seen >= since) n++;
+    return n;
   }
 
   /** Whether mediation and moderation by agents are on (enough eligible mediators to draw independent ones). */
@@ -344,20 +394,29 @@ export class Context {
    */
   mediatorCondition(): { sql: string; params: number[] } {
     const c = this.config;
-    const requesters = `(SELECT COUNT(DISTINCT x.requester_id) FROM missions x WHERE x.solver_id = agents.agent_id AND x.status = 'accepted'
-             AND x.control_id IS NULL AND x.honeypot_id IS NULL)`;
+    // Requesters that count: those who themselves paid several different solvers. The list is computed once
+    // per statement (an uncorrelated subquery), not once per agent and requester: on a busy market the
+    // correlated version took seconds.
+    const s = c.mediatorRequesterMinSolvers;
+    const payers = s > 0
+      ? `AND x.requester_id IN (SELECT y.requester_id FROM missions y WHERE y.status = 'accepted' AND y.control_id IS NULL
+           AND y.honeypot_id IS NULL GROUP BY y.requester_id HAVING COUNT(DISTINCT y.solver_id) >= ${Math.floor(s)})`
+      : "";
+    // Solvers paid by at least n different (counting) requesters: computed once per statement too.
+    const paidBy = (n: number) => n <= 0 ? "1" : `agents.agent_id IN (SELECT x.solver_id FROM missions x WHERE x.status = 'accepted'
+             AND x.control_id IS NULL AND x.honeypot_id IS NULL AND x.solver_id IS NOT NULL ${payers}
+             GROUP BY x.solver_id HAVING COUNT(DISTINCT x.requester_id) >= ${Math.floor(n)})`;
     return {
       sql: `agents.system = 0 AND agents.banned = 0 AND agents.reputation >= ? AND agents.credits >= ?
-        AND ${requesters} >= ? AND (agents.batches_passed >= ? OR ${requesters} >= ?)`,
-      params: [c.mediatorMinReputation, c.mediatorBondCredits, c.mediatorMinRequesters, c.mediatorMinBatches, c.mediatorRequestersWithoutBatches],
+        AND ${paidBy(c.mediatorMinRequesters)}
+        AND (agents.batches_passed >= ? OR ${paidBy(c.mediatorRequestersWithoutBatches)})`,
+      params: [c.mediatorMinReputation, c.mediatorBondCredits, c.mediatorMinBatches],
     };
   }
 
   /** Eligible to be drawn as a mediator or moderator, and community mediation is on. */
   canMediate(agentId: string): boolean {
-    if (!this.communityActive()) return false;
-    const m = this.mediatorCondition();
-    return !!this.db.prepare(`SELECT 1 FROM agents WHERE agent_id = ? AND ${m.sql}`).get(agentId, ...m.params);
+    return this.communityActive() && this.eligible().has(agentId);
   }
 
   /**
@@ -377,14 +436,17 @@ export class Context {
     const minted = this.db
       .prepare(
         `SELECT COALESCE(SUM(CASE WHEN reason IN ('work', 'generated', 'honeypot', 'mediation', 'moderation') THEN credits
-                                  WHEN reason = 'advance' AND credits > 0 THEN credits ELSE 0 END), 0) AS direct,
+                                  ELSE 0 END), 0) AS direct,
+                COALESCE(SUM(CASE WHEN reason = 'advance' THEN credits ELSE 0 END), 0) AS advance,
                 COALESCE(SUM(CASE WHEN reason = 'control' THEN credits ELSE 0 END), 0) AS control
          FROM supply WHERE created_at >= ?`,
       )
-      .get(since) as { direct: number; control: number };
+      .get(since) as { direct: number; advance: number; control: number };
     return {
       budget: Math.floor(cfg.mintBaseCreditsPerDay + (cfg.mintActivityRatio * paid.c) / 7),
-      minted: minted.direct + Math.max(0, minted.control),
+      // Advances count net of their repayments: posting with an advance and cancelling creates nothing,
+      // so it must not use up the budget either.
+      minted: minted.direct + Math.max(0, minted.advance) + Math.max(0, minted.control),
     };
   }
 }

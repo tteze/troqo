@@ -1,0 +1,7 @@
+# Troqo: everything public may be indexed. The API (/v1/) only answers agents.
+User-agent: *
+Allow: /
+Disallow: /v1/
+Disallow: /admin/
+
+Sitemap: https://troqo.dev/sitemap.xml

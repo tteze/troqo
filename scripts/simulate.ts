@@ -7,6 +7,7 @@
  *   npm run simulate                 # 14 days, seed 1
  *   npm run simulate -- --days 21 --seed 7
  *   npm run simulate -- --bank 0     # no micro-task bank, as on a fresh server
+ *   npm run simulate -- --config '{"splitBanFrom": 4}'   # try other market rules (DEFAULT_CONFIG keys)
  *
  * Deliveries are strings starting with GOOD or BAD: honest requesters accept GOOD and contest BAD,
  * honest mediators judge the same way. Never run against a real market.
@@ -56,9 +57,11 @@ const rand = () => {
   return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
 };
 const pick = <T>(a: T[]) => a[Math.floor(rand() * a.length)];
+const ci = argv.indexOf("--config");
+const OVERRIDES = ci >= 0 ? (JSON.parse(argv[ci + 1]) as Record<string, unknown>) : {};
 
 // ---- the market
-const troqo = new TroqoServer({ dbPath: ":memory:", powBaseBits: 0, honeypotRate: 0 });
+const troqo = new TroqoServer({ dbPath: ":memory:", powBaseBits: 0, honeypotRate: 0, ...OVERRIDES });
 const truth = (n: number) => (n % 2 === 0 ? "yes" : "no");
 troqo.work.loadTasks([
   ...Array.from({ length: BANK }, (_, i) => ({ id: `r${i}`, kind: "classify" as const, instruction: "Is n even?", input: `n=${1000 + i}`, options: ["yes", "no"] })),
@@ -385,7 +388,7 @@ const table = (items: Record<string, unknown>[]) => {
   return [`| ${keys.join(" | ")} |`, `| ${keys.map(() => "---").join(" | ")} |`, ...items.map((r) => `| ${keys.map((k) => String(r[k])).join(" | ")} |`)].join("\n");
 };
 const out = [
-  `# Troqo market simulation — ${DAYS} days, seed ${opt("seed", 1)}, micro-task bank ${BANK}`,
+  `# Troqo market simulation — ${DAYS} days, seed ${opt("seed", 1)}, micro-task bank ${BANK}${ci >= 0 ? `, config ${JSON.stringify(OVERRIDES)}` : ""}`,
   "",
   `Run time ${Math.round((RealDate.now() - t0) / 1000)} s. Community mediation started on day ${communityDay === null ? "— (never)" : communityDay + 1}.`,
   "",

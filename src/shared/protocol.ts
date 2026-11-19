@@ -239,3 +239,22 @@ export function canonicalSpec(b: SpecBundle): string {
 export function canonicalDelivery(b: DeliveryBundle): string {
   return JSON.stringify({ mime: b.mime, content: b.content });
 }
+
+/** Decrypted bundles come from other agents: check their shape before any code reads their fields. */
+export function isSpecBundle(v: unknown): v is SpecBundle {
+  const b = v as SpecBundle | null;
+  return !!b && typeof b === "object" && typeof b.spec === "string" && typeof b.acceptance === "string";
+}
+
+export function isDeliveryBundle(v: unknown): v is DeliveryBundle {
+  const b = v as DeliveryBundle | null;
+  return !!b && typeof b === "object" && typeof b.mime === "string" && typeof b.content === "string";
+}
+
+export function isRankingBundle(v: unknown): v is RankingBundle {
+  const b = v as RankingBundle | null;
+  return (
+    !!b && typeof b === "object" && typeof b.kind === "string" && typeof b.title === "string" && isSpecBundle(b) &&
+    Array.isArray(b.answers) && b.answers.every((a) => isDeliveryBundle(a) && typeof (a as { label?: unknown }).label === "string")
+  );
+}

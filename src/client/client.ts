@@ -3,6 +3,9 @@ import { TroqoError } from "../shared/errors.js";
 import {
   canonicalDelivery,
   canonicalSpec,
+  isDeliveryBundle,
+  isRankingBundle,
+  isSpecBundle,
   type Account,
   type AgentEvents,
   type AgentProfile,
@@ -264,6 +267,11 @@ export class TroqoClient {
     return this.api.call<MissionInfo>("POST", `/v1/missions/${missionId}/take`);
   }
 
+  /** Hands a mission back before delivering (bond returned, no penalty; a few per day). */
+  releaseMission(missionId: string) {
+    return this.api.call<MissionInfo>("POST", `/v1/missions/${missionId}/release`);
+  }
+
   /** Encrypts the delivery for the requester and records its fingerprint on the market. */
   async deliver(missionId: string, delivery: DeliveryBundle): Promise<MissionInfo> {
     const m = await this.mission(missionId);
@@ -356,7 +364,8 @@ export class TroqoClient {
     for (const msg of inbox.messages) {
       if (msg.kind === "ranking") {
         try {
-          const bundle = JSON.parse(open(msg.envelope, this.identity).toString("utf8")) as RankingBundle;
+          const bundle: unknown = JSON.parse(open(msg.envelope, this.identity).toString("utf8"));
+          if (!isRankingBundle(bundle)) throw new Error("not a ranking bundle");
           this.store.update(msg.missionId, (l) => (l.ranking = bundle));
           report.received++;
         } catch (err) {
@@ -370,8 +379,18 @@ export class TroqoClient {
         const m = await info(msg.missionId);
         const isSpec = msg.kind === "spec" || msg.kind === "evidence-spec";
         const expected = isSpec ? m.specHash : (m.deliveryHash ?? (await this.deliveryHashFor(msg.missionId)));
-        const tampered = sha256(plain) !== expected;
-        const parsed = JSON.parse(plain);
+        let parsed: unknown;
+        try {
+          parsed = JSON.parse(plain);
+        } catch {
+          parsed = undefined;
+        }
+        // Written by another agent. A bundle of the wrong shape is never stored as is (prompts and tools read
+        // its fields): an empty one takes its place, flagged like a piece that does not match its fingerprint,
+        // so a mediator still rules, against whoever sent it.
+        const wellFormed = isSpec ? isSpecBundle(parsed) : isDeliveryBundle(parsed);
+        if (!wellFormed) parsed = isSpec ? { spec: "", acceptance: "" } : { mime: "text/plain", content: "" };
+        const tampered = !wellFormed || sha256(plain) !== expected;
         this.store.update(msg.missionId, (l) => {
           if (msg.kind === "spec") (l.spec = parsed as SpecBundle), (l.specTampered = tampered);
           else if (msg.kind === "delivery") (l.delivery = parsed as DeliveryBundle), (l.deliveryTampered = tampered);
@@ -381,7 +400,7 @@ export class TroqoClient {
             else (l.evidence.delivery = parsed as DeliveryBundle), (l.evidence.deliveryTampered = tampered);
           }
         });
-        if (tampered) report.problems.push(`${msg.kind} of mission ${msg.missionId} does not match its fingerprint`);
+        if (tampered) report.problems.push(`${msg.kind} of mission ${msg.missionId} ${wellFormed ? "does not match its fingerprint" : "is malformed"}`);
         report.received++;
       } catch (err) {
         report.problems.push(`Could not read ${msg.kind} of mission ${msg.missionId}: ${(err as Error).message}`);

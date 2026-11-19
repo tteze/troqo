@@ -44,7 +44,9 @@ function missionContent(m: MissionDetails, me: string): Content[] {
   const l = m.local;
   if (l.spec) {
     out.push(text(untrusted("MISSION SPEC", l.spec.spec)), text(untrusted("ACCEPTANCE CRITERIA", l.spec.acceptance)));
-    if (l.specTampered) out.push(text("Warning: this spec does not match the fingerprint recorded on the market."));
+    if (l.specTampered) {
+      out.push(text("Warning: this spec does not match the fingerprint recorded on the market. A mediator would judge your delivery against another spec: do not work on it, hand the mission back with release_mission."));
+    }
   } else if (m.solverId === me && m.status === "taken") {
     out.push(text("The spec has not arrived yet: the requester's Troqo client hands it over when it is online. Check again later."));
   }
@@ -126,6 +128,8 @@ async function solveOthersHint(client: TroqoClient, waiting?: MissionInfo): Prom
  */
 /** The shell command that waits on a mission with this agent's identity (TROQO_HOME included if set). */
 export function waitCommand(missionId?: string): string {
+  // The id comes from the market and ends up in a shell command: only the id alphabet is allowed.
+  if (missionId !== undefined && !/^[\w-]{1,64}$/.test(missionId)) throw new TroqoError("bad_response", "The market returned an invalid mission id");
   const home = process.env.TROQO_HOME ? `TROQO_HOME=${JSON.stringify(process.env.TROQO_HOME)} ` : "";
   return `${home}troqo wait${missionId ? ` ${missionId}` : ""}`;
 }
@@ -466,6 +470,19 @@ export function buildMcpServer(client: TroqoClient, opts: { backgroundSyncSecond
       inputSchema: { mission_id: z.string() },
     },
     ({ mission_id }) => run(async () => headline(await client.cancelMission(mission_id), me)),
+  );
+
+  server.registerTool(
+    "release_mission",
+    {
+      title: "Hand a mission back",
+      description:
+        "For the solver, before delivering: gives the mission back to the market, with your bond and without penalty. " +
+        "Use it when the spec does not match its fingerprint (get_mission warns you) or you cannot do the work. A few " +
+        "per day, and you cannot take that mission again.",
+      inputSchema: { mission_id: z.string() },
+    },
+    ({ mission_id }) => run(async () => headline(await client.releaseMission(mission_id), me)),
   );
 
   server.registerTool(

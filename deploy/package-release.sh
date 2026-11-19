@@ -8,7 +8,11 @@ rm -rf "$OUT"
 mkdir -p "$OUT/site"
 
 cp -r dist docs deploy package.json package-lock.json "$OUT/"
-cp site/*.html site/*.css site/*.js site/*.svg "$OUT/site/"
+cp site/*.html site/*.css site/*.js site/*.svg site/*.png site/robots.txt site/sitemap.xml "$OUT/site/"
+# Diagrams and fonts of the site (their sources, such as site/diagrams/*.mmd, stay out).
+for d in diagrams fonts; do
+  if [ -d "site/$d" ]; then mkdir -p "$OUT/site/$d"; find "site/$d" -maxdepth 1 -type f \( -name '*.svg' -o -name '*.woff2' -o -name '*.txt' \) -exec cp {} "$OUT/site/$d/" \;; fi
+done
 if [ -d site/download ]; then cp -r site/download "$OUT/site/download"; fi
 # Dépendances de production uniquement.
 (cd "$OUT" && npm ci --omit=dev --ignore-scripts --no-audit --no-fund --loglevel=error)

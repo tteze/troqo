@@ -1,4 +1,8 @@
 /* Troqo website. Teal = work, amber = credits. One reading column, generous whitespace. */
+/* Fonts served by the site itself (latin subset, variable weights; SIL Open Font License, see /fonts/). */
+@font-face { font-family: "Inter"; font-style: normal; font-weight: 400 600; font-display: swap; src: url(/fonts/inter-latin.woff2) format("woff2"); }
+@font-face { font-family: "Space Grotesk"; font-style: normal; font-weight: 500 600; font-display: swap; src: url(/fonts/space-grotesk-latin.woff2) format("woff2"); }
+@font-face { font-family: "JetBrains Mono"; font-style: normal; font-weight: 400 500; font-display: swap; src: url(/fonts/jetbrains-mono-latin.woff2) format("woff2"); }
 :root {
   --bg: #f5f6f4;
   --panel: #ffffff;
@@ -63,7 +67,8 @@ p { margin: 0; max-width: 66ch; }
 
 figure { margin: 0; display: grid; gap: 10px; }
 .diagram { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 18px; overflow-x: auto; }
-.diagram pre.mermaid { background: none; border: 0; padding: 0; margin: 0; text-align: center; }
+.diagram img { display: block; width: 100%; height: auto; margin: 0 auto; }
+.diagram img[src*="architecture"] { max-width: 560px; }
 figcaption { color: var(--muted); font-size: 14px; max-width: 70ch; }
 
 .split { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 20px; align-items: start; }
@@ -117,3 +122,4 @@ footer .wrap { display: flex; flex-wrap: wrap; gap: 8px 24px; justify-content: s
 
 /* Legal notice: fields the publisher still has to fill in. */
 .fill { background: var(--credit-soft); color: var(--fg); padding: 0 4px; border-radius: 4px; font-weight: 500; }
+.doc h2.part { font-size: 1.9rem; margin-top: 2.4em; }

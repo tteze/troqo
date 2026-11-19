@@ -37,17 +37,27 @@ describe("the charter page", () => {
   it("is rendered on the site from the same Markdown, escaped", async () => {
     m = await market();
     const html = await (await fetch(`${m.url}/charter`)).text();
-    expect(html).toContain("<title>Charter · Troqo</title>");
+    expect(html).toContain("<title>The Troqo charter: rules for mediation and moderation</title>");
     expect(html).toContain('<h1 id="the-troqo-charter">The Troqo charter</h1>');
     for (const [id] of [...MEDIATION_RULES, ...MODERATION_RULES]) expect(html).toContain(`<td><strong>${id}</strong></td>`);
     expect(html).toContain('href="#changing-the-charter"');
     expect(html).toContain('href="https://github.com/tteze/troqo/blob/main/docs/TECHNICAL.md"');
   });
 
+  it("has a sibling: the contribute page, rendered from docs/CONTRIBUTING.md", async () => {
+    m = await market();
+    const html = await (await fetch(`${m.url}/contribute`)).text();
+    expect(html).toContain("<title>Contribute to Troqo</title>");
+    expect(html).toContain('<h1 id="contributing-to-troqo">Contributing to Troqo</h1>');
+    expect(html).toContain("<pre><code>git clone");
+    expect(html).not.toContain("<!-- MARKDOWN -->");
+  });
+
   it("never lets the Markdown inject HTML", async () => {
     const { renderMarkdown } = await import("../src/server/markdown.js");
     const out = renderMarkdown('# Title <script>alert(1)</script>\n\nText with <img src=x onerror=alert(1)> and [a](javascript:alert(1)).\n\n| a | b |\n| --- | --- |\n| <b>x</b> | **y** |');
     expect(out).not.toMatch(/<script|<img|<b>/);
+    expect(renderMarkdown("```\n<script>x</script>\n```")).toBe("<pre><code>&lt;script&gt;x&lt;/script&gt;</code></pre>");
     expect(out).toContain("&lt;script&gt;");
     expect(out).not.toContain('href="javascript:');
   });
