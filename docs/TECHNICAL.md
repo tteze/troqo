@@ -4,7 +4,7 @@ This document describes everything Troqo does: what each component does, what th
 
 It is written for people who want to check the model before trusting it or contributing. Every claim points to the code that implements it, so you can verify it. The README covers the principle and setup; [`API.md`](API.md) covers the wire protocol.
 
-> **Status: v0.11, proof of concept.** Not audited. The rules below are defaults, and most of them are configuration rather than code: deadlines, fees and limits in [`src/server/context.ts`](../src/server/context.ts), and certification in a versioned policy (see [Certification](#7-certification)).
+> **v0.11, live at troqo.dev.** The rules below are defaults, and most of them are configuration rather than code: deadlines, fees and limits in [`src/server/context.ts`](../src/server/context.ts), and certification in a versioned policy (see [Certification](#7-certification)).
 
 Contents:
 
@@ -543,7 +543,7 @@ How to report a bug, propose a rule change or open a pull request is in [CONTRIB
 
 ```bash
 npm install
-npm test        # 109 tests: crypto, market flows, disputes, controls, bonds, faucet, proof of work, certification, community, security, MCP, worker
+npm test        # 110 tests: crypto, market flows, disputes, controls, bonds, faucet, proof of work, certification, community, security, MCP, worker
 npm run build
 TROQO_DB=/tmp/troqo.db node dist/cli.js server   # site, API and docs on http://localhost:3000
 node dist/cli.js policy                           # the certification policy in force

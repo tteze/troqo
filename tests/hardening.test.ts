@@ -226,6 +226,13 @@ describe("website", () => {
     expect((await fetch(`${m.url}/og.png`)).headers.get("content-type")).toBe("image/png");
   });
 
+  it("keeps elements with the hidden attribute hidden, and long code inside its block (phones)", async () => {
+    m = await market();
+    const css = await (await fetch(`${m.url}/style.css`)).text();
+    expect(css).toContain("[hidden] { display: none !important; }"); // the prompt tabs rely on it
+    expect(css).toMatch(/main, section,[^{]*\.doc[^{]*\{ grid-template-columns: minmax\(0, 1fr\); \}/);
+  });
+
   it("is sent compressed, and not sent again to a browser that has it", async () => {
     m = await market();
     const first = await fetch(`${m.url}/style.css`, { headers: { "accept-encoding": "br" } });

@@ -35,7 +35,11 @@ pre { background: var(--panel); border: 1px solid var(--line); border-radius: 8p
 
 .wrap { max-width: 1040px; margin: 0 auto; padding-left: max(20px, env(safe-area-inset-left, 0px)); padding-right: max(20px, env(safe-area-inset-right, 0px)); }
 header.top { border-bottom: 1px solid var(--line); background: var(--bg); position: sticky; top: 0; z-index: 5; }
-header.top .wrap { display: flex; align-items: center; justify-content: space-between; gap: 16px; min-height: 60px; flex-wrap: wrap; }
+header.top .wrap { display: flex; align-items: center; justify-content: space-between; gap: 10px 16px; min-height: 60px; flex-wrap: wrap; padding-top: 12px; padding-bottom: 12px; }
+/* Elements hidden with the hidden attribute stay hidden, whatever display their class sets (tabs, notices). */
+[hidden] { display: none !important; }
+/* On a phone the navigation wraps: a header that stays pinned would take a fifth of the screen. */
+@media (max-width: 640px) { header.top { position: static; } }
 .brand { font-family: var(--display); font-weight: 600; font-size: 20px; color: var(--fg); text-decoration: none; display: inline-flex; align-items: center; gap: 10px; }
 .brand svg { width: 26px; height: 26px; }
 nav { display: flex; gap: 6px 20px; flex-wrap: wrap; }
@@ -69,6 +73,11 @@ figure { margin: 0; display: grid; gap: 10px; }
 .diagram { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 18px; overflow-x: auto; }
 .diagram img { display: block; width: 100%; height: auto; margin: 0 auto; }
 .diagram img[src*="architecture"] { max-width: 560px; }
+/* On a phone, wide diagrams keep a readable size and scroll sideways inside their frame. */
+@media (max-width: 640px) {
+  .diagram { padding: 12px; }
+  .diagram img[src*="exchange"], .diagram img[src*="lifecycle"] { width: 820px; max-width: none; }
+}
 figcaption { color: var(--muted); font-size: 14px; max-width: 70ch; }
 
 .split { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 20px; align-items: start; }
@@ -123,3 +132,7 @@ footer .wrap { display: flex; flex-wrap: wrap; gap: 8px 24px; justify-content: s
 /* Legal notice: fields the publisher still has to fill in. */
 .fill { background: var(--credit-soft); color: var(--fg); padding: 0 4px; border-radius: 4px; font-weight: 500; }
 .doc h2.part { font-size: 1.9rem; margin-top: 2.4em; }
+/* Single-column grids: a long line of code scrolls inside its block instead of widening the page. */
+main, section, .hero, figure, .doc, .doc ul, .doc ol, .steps, .card, .prompts, .prompt-panel, .stat { grid-template-columns: minmax(0, 1fr); }
+pre { max-width: 100%; }
+:not(pre) > code { overflow-wrap: anywhere; }
