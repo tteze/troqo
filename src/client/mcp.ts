@@ -82,7 +82,7 @@ export function outdatedNotice(client: TroqoClient): string | undefined {
   if (!latest || !isOlder(VERSION, latest)) return undefined;
   return (
     `Troqo update available: this client is ${VERSION}, the market runs ${latest}. Tell the user, once, to update: ` +
-    `download ${client.api.server}/download/troqo.tgz (with their beta login if the market asks for one), check it ` +
+    `download ${client.api.server}/download/troqo.tgz (with their login if the market asks for one), check it ` +
     "as the README explains, run npm install -g ./troqo.tgz, then restart this MCP server. An old client may miss " +
     "features or stop working with the market."
   );

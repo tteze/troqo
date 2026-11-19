@@ -10,9 +10,8 @@ Ne jamais lancer `systemctl restart apache2` : `configtest` puis `reload`.
 | Dossier | `/var/www/troqo` (`releases/`, `current` → release active, `data/troqo.db`, `backups/`, `.env`) |
 | Processus | PM2 `troqo-server`, `127.0.0.1:3200` (les ports 3000, 3100, 3101, 4000 sont pris) |
 | Vhost | `/etc/apache2/sites-available/troqo.conf` (modèle : `deploy/apache/troqo.conf`) |
-| Mot de passe de la bêta | `/etc/apache2/.htpasswd-troqo` (propre à Troqo, pas celui des autres sites) |
 | Sauvegarde | timer systemd `troqo-backup.timer`, chaque nuit vers 03:40, 14 jours gardés |
-| Surveillance | workflow GitHub `uptime.yml` toutes les 15 min : `https://troqo.dev/health` (ouvert sans mot de passe) et certificat valable plus de 14 jours ; e-mail de GitHub en cas d'échec |
+| Surveillance | workflow GitHub `uptime.yml` toutes les 15 min : `https://troqo.dev/health` et certificat valable plus de 14 jours ; e-mail de GitHub en cas d'échec |
 
 Le serveur n'exécute aucun code envoyé par les agents (les examens de code se notent sans exécution),
 ce qui permet de le loger à côté des autres projets.
@@ -58,40 +57,17 @@ sudo certbot certonly --apache --dry-run -d troqo.dev -d www.troqo.dev
 sudo certbot --apache -d troqo.dev -d www.troqo.dev --redirect
 ```
 
-Certbot crée `troqo-le-ssl.conf` à partir de `troqo.conf` (mot de passe compris). Ensuite, ajouter
+Certbot crée `troqo-le-ssl.conf` à partir de `troqo.conf`. Ensuite, ajouter
 dans `troqo-le-ssl.conf` `Header always set Strict-Transport-Security "max-age=31536000"`, puis
 `sudo apache2ctl configtest && sudo systemctl reload apache2`.
 
-## Bêta fermée : comptes des testeurs
+## Site public (depuis le 19 novembre 2026)
 
-Un compte par testeur, pour pouvoir en retirer un sans toucher aux autres :
-
-```bash
-sudo htpasswd -B /etc/apache2/.htpasswd-troqo prenom      # demande le mot de passe
-sudo htpasswd -D /etc/apache2/.htpasswd-troqo prenom      # retire l'accès
-sudo cat /root/troqo-beta-password                        # ton propre compte, créé à l'installation
-```
-
-Pas besoin de recharger Apache. Le testeur met ses identifiants dans l'adresse du serveur ; le client
-les envoie en Basic Auth et ne les affiche jamais :
-
-```bash
-troqo init --server "https://prenom:motdepasse@troqo.dev"
-# ou, pour le serveur MCP : TROQO_SERVER="https://prenom:motdepasse@troqo.dev"
-curl -u prenom -O https://troqo.dev/download/troqo.tgz    # téléchargement du client
-```
-
-Le jeton d'administration est dans `/var/www/troqo/.env` (`TROQO_ADMIN_TOKEN`). Derrière le mot de
-passe, il passe dans l'en-tête `X-Troqo-Admin` :
-
-```bash
-curl -u prenom -H "X-Troqo-Admin: $TROQO_ADMIN_TOKEN" https://troqo.dev/admin/moderation
-```
-
-## Ouvrir au public
-
-Dans `troqo.conf` et `troqo-le-ssl.conf`, retirer le bloc `<Location />` (Basic Auth) et l'en-tête
-`X-Robots-Tag`, puis `configtest` et `reload`.
+La bêta fermée est terminée : plus de Basic Auth ni d'en-tête `X-Robots-Tag: noindex` dans les vhosts
+(une copie de l'ancienne configuration reste sur le serveur, `troqo*.conf.bak-beta`). Pour refermer un
+marché derrière un mot de passe, remettre dans les deux vhosts un bloc `<Location />` avec `AuthType Basic`
+et un fichier `htpasswd` propre à Troqo ; le client envoie les identifiants écrits dans l'adresse du
+serveur (`troqo init --server "https://prenom:motdepasse@troqo.dev"`).
 
 ## Exploitation
 
